@@ -31,8 +31,8 @@ func TestServerBasicCommands(t *testing.T) {
 		wd = filepath.Join(wd, "cmd", "bitgaskd")
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "run", ".", "-dir", dir, "-addr", addr)
-	cmd.Dir = wd
+	bin := buildServerBinary(t, wd)
+	cmd := exec.CommandContext(ctx, bin, "-dir", dir, "-addr", addr)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -68,6 +68,19 @@ func TestServerBasicCommands(t *testing.T) {
 
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
+}
+
+func buildServerBinary(t *testing.T, wd string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "bitgaskd")
+	cmd := exec.Command("go", "build", "-o", out, ".")
+	cmd.Dir = wd
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("build server: %v", err)
+	}
+	return out
 }
 
 func freeAddr(t *testing.T) string {
