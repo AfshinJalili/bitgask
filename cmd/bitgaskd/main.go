@@ -13,6 +13,13 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+// Set via goreleaser ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type serverConfig struct {
 	dir           string
 	addr          string

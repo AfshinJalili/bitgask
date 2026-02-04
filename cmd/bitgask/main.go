@@ -11,6 +11,13 @@ import (
 	"github.com/AfshinJalili/bitgask"
 )
 
+// Set via goreleaser ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type commonFlags struct {
 	dir            string
 	maxKey         int
