@@ -25,13 +25,13 @@ func (r Report) HasErrors() bool {
 	return r.CorruptRecords > 0 || len(r.Errors) > 0
 }
 
-func Validate(path string, opts Options) (Report, error) {
-	opts = opts.withDefaults()
+func Validate(path string, opts ...Option) (Report, error) {
+	cfg := applyOptions(opts)
 	if path == "" {
 		return Report{}, fmt.Errorf("bitgask: path required")
 	}
 	dataDir := filepath.Join(path, "data")
-	lock, err := file.AcquireLock(filepath.Join(dataDir, lockFileName), opts.LockTimeout)
+	lock, err := file.AcquireLock(filepath.Join(path, lockFileName), cfg.LockTimeout)
 	if err != nil {
 		return Report{}, ErrLocked
 	}
@@ -44,7 +44,7 @@ func Validate(path string, opts Options) (Report, error) {
 	var report Report
 	report.DataFiles = len(files)
 	for _, id := range files {
-		path := filepath.Join(dataDir, file.DataFileName(id, opts.FileIDWidth))
+		path := filepath.Join(dataDir, file.DataFileName(id, cfg.FileIDWidth))
 		f, err := os.Open(path)
 		if err != nil {
 			report.Errors = append(report.Errors, err)
@@ -70,9 +70,9 @@ func Validate(path string, opts Options) (Report, error) {
 		_ = f.Close()
 	}
 
-	if opts.UseHintFiles {
+	if cfg.UseHintFiles {
 		for _, id := range files {
-			path := filepath.Join(dataDir, file.HintFileName(id, opts.FileIDWidth))
+			path := filepath.Join(dataDir, file.HintFileName(id, cfg.FileIDWidth))
 			hintFile, err := os.Open(path)
 			if err != nil {
 				report.Errors = append(report.Errors, err)
@@ -90,7 +90,7 @@ func Validate(path string, opts Options) (Report, error) {
 					break
 				}
 				// Spot check that hint entry points to matching key
-				dataPath := filepath.Join(dataDir, file.DataFileName(entry.FileID, opts.FileIDWidth))
+				dataPath := filepath.Join(dataDir, file.DataFileName(entry.FileID, cfg.FileIDWidth))
 				dataFile, err := os.Open(dataPath)
 				if err != nil {
 					report.Errors = append(report.Errors, err)

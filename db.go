@@ -2,11 +2,12 @@ package bitgask
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"github.com/AfshinJalili/bitgask/internal/codec"
 	"github.com/AfshinJalili/bitgask/internal/file"
 	"github.com/AfshinJalili/bitgask/internal/index"
+	"github.com/AfshinJalili/bitgask/internal/keydir"
 	"github.com/AfshinJalili/bitgask/internal/record"
 )
 
@@ -31,13 +33,14 @@ type MergeOptions struct {
 type DB struct {
 	dir     string
 	dataDir string
-	opts    Options
+	opts    config
 
 	lock *file.Lock
 
+	opMu      sync.RWMutex
 	mu        sync.RWMutex
 	writeMu   sync.Mutex
-	index     map[string]RecordMeta
+	index     keydir.Keydir
 	dataFiles map[uint32]*os.File
 	active    *dataFile
 	stats     Stats
@@ -58,53 +61,52 @@ type dataFile struct {
 	size int64
 }
 
-func Open(path string, opts Options) (*DB, error) {
+func Open(path string, opts ...Option) (*DB, error) {
 	return openDB(path, opts, false)
 }
 
-func Repair(path string, opts Options) (*DB, error) {
+func Repair(path string, opts ...Option) (*DB, error) {
 	return openDB(path, opts, true)
 }
 
-func openDB(path string, opts Options, repair bool) (*DB, error) {
-	opts = opts.withDefaults()
+func openDB(path string, opts []Option, repair bool) (*DB, error) {
+	cfg := applyOptions(opts)
 	if path == "" {
 		return nil, fmt.Errorf("bitgask: path required")
 	}
-	if err := os.MkdirAll(path, opts.DirMode); err != nil {
+	if err := os.MkdirAll(path, cfg.DirMode); err != nil {
 		return nil, err
 	}
 	dataDir := filepath.Join(path, "data")
-	if err := os.MkdirAll(dataDir, opts.DirMode); err != nil {
+	if err := os.MkdirAll(dataDir, cfg.DirMode); err != nil {
 		return nil, err
 	}
-
-	lock, err := file.AcquireLock(filepath.Join(dataDir, lockFileName), opts.LockTimeout)
+	lock, err := file.AcquireLock(filepath.Join(path, lockFileName), cfg.LockTimeout)
 	if err != nil {
 		return nil, ErrLocked
 	}
 
-	if err := writeMeta(dataDir, opts); err != nil {
+	if err := writeMeta(dataDir, cfg); err != nil {
 		_ = lock.Release()
 		return nil, err
 	}
 
 	var (
-		idx    map[string]RecordMeta
+		idx    keydir.Keydir
 		stats  Stats
 		lastID uint32
 	)
 	if repair {
-		idx, stats, lastID, err = loadFromData(dataDir, opts, true, opts.UseHintFiles)
-	} else if opts.ValidateOnOpen {
-		idx, stats, lastID, err = loadFromData(dataDir, opts, false, false)
-	} else if opts.UseHintFiles {
-		idx, stats, lastID, err = loadFromHints(dataDir, opts)
+		idx, stats, lastID, err = loadFromData(dataDir, cfg, true, cfg.UseHintFiles)
+	} else if cfg.ValidateOnOpen {
+		idx, stats, lastID, err = loadFromData(dataDir, cfg, false, false)
+	} else if cfg.UseHintFiles {
+		idx, stats, lastID, err = loadFromHints(dataDir, cfg)
 		if err != nil {
-			idx, stats, lastID, err = loadFromData(dataDir, opts, false, false)
+			idx, stats, lastID, err = loadFromData(dataDir, cfg, false, false)
 		}
 	} else {
-		idx, stats, lastID, err = loadFromData(dataDir, opts, false, false)
+		idx, stats, lastID, err = loadFromData(dataDir, cfg, false, false)
 	}
 	if err != nil {
 		_ = lock.Release()
@@ -115,7 +117,7 @@ func openDB(path string, opts Options, repair bool) (*DB, error) {
 		lastID = 1
 	}
 
-	active, err := openActiveFile(dataDir, lastID, opts)
+	active, err := openActiveFile(dataDir, lastID, cfg)
 	if err != nil {
 		_ = lock.Release()
 		return nil, err
@@ -127,7 +129,7 @@ func openDB(path string, opts Options, repair bool) (*DB, error) {
 	db := &DB{
 		dir:       path,
 		dataDir:   dataDir,
-		opts:      opts,
+		opts:      cfg,
 		lock:      lock,
 		index:     idx,
 		dataFiles: map[uint32]*os.File{active.id: active.file},
@@ -139,12 +141,12 @@ func openDB(path string, opts Options, repair bool) (*DB, error) {
 		syncDone:  make(chan struct{}),
 	}
 
-	if opts.MergeOnOpen {
+	if cfg.MergeOnOpen {
 		_, _ = db.CompactIfNeeded()
 	}
 
 	go db.mergeLoop()
-	if opts.SyncInterval > 0 {
+	if cfg.SyncInterval > 0 {
 		go db.syncLoop()
 	} else {
 		close(db.syncDone)
@@ -156,6 +158,8 @@ func (db *DB) Close() error {
 	if db == nil {
 		return nil
 	}
+	db.opMu.Lock()
+	defer db.opMu.Unlock()
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -177,7 +181,9 @@ func (db *DB) Close() error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	defer func() {
-		_ = db.lock.Release()
+		if db.lock != nil {
+			_ = db.lock.Release()
+		}
 	}()
 
 	db.mu.Lock()
@@ -191,22 +197,33 @@ func (db *DB) Close() error {
 	return nil
 }
 
-func (db *DB) Put(key, value []byte, ttl ...time.Duration) error {
+func (db *DB) Put(key, value []byte) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	return db.putWithTTL(key, value, db.opts.DefaultTTL)
+}
+
+func (db *DB) PutWithTTL(key, value []byte, ttl time.Duration) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	return db.putWithTTL(key, value, ttl)
+}
+
+func (db *DB) putWithTTL(key, value []byte, ttlVal time.Duration) error {
 	if db == nil {
 		return ErrClosed
 	}
 	if len(key) == 0 {
-		return ErrKeyNotFound
+		return ErrInvalidKey
 	}
 	if len(key) > db.opts.MaxKeySize || len(value) > db.opts.MaxValueSize {
 		return ErrOversized
-	}
-
-	var ttlVal time.Duration
-	if len(ttl) > 0 {
-		ttlVal = ttl[0]
-	} else {
-		ttlVal = db.opts.DefaultTTL
 	}
 	now := time.Now()
 	var expiresAt int64
@@ -267,10 +284,11 @@ func (db *DB) Put(key, value []byte, ttl ...time.Duration) error {
 			Flags:   flags,
 		}
 		if err := index.WriteHint(db.active.hint, hintEntry); err != nil {
-			return err
-		}
-		if db.opts.HintFileSync && db.opts.SyncOnPut {
-			_ = db.active.hint.Sync()
+			logf(db.opts.Logger, "bitgask: hint write failed: %v", err)
+		} else if db.opts.HintFileSync && db.opts.SyncOnPut {
+			if err := db.active.hint.Sync(); err != nil {
+				logf(db.opts.Logger, "bitgask: hint sync failed: %v", err)
+			}
 		}
 	}
 	if db.opts.SyncOnPut {
@@ -288,10 +306,10 @@ func (db *DB) Put(key, value []byte, ttl ...time.Duration) error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	old, ok := db.index[string(key)]
+	old, ok := db.indexGet(key)
 	if ok && isExpired(old, now) {
 		// remove expired old record
-		delete(db.index, string(key))
+		db.indexDelete(key)
 		if !old.Deleted {
 			db.stats.Keys--
 		}
@@ -305,7 +323,7 @@ func (db *DB) Put(key, value []byte, ttl ...time.Duration) error {
 	if !ok || old.Deleted {
 		db.stats.Keys++
 	}
-	db.index[string(key)] = meta
+	db.indexSet(key, meta)
 	return nil
 }
 
@@ -313,37 +331,71 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if db == nil {
 		return nil, ErrClosed
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	if len(key) == 0 {
+		return nil, ErrInvalidKey
+	}
 	now := time.Now()
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	meta, ok := db.index[string(key)]
+	meta, ok := db.indexGet(key)
 	db.mu.RUnlock()
 	if !ok || meta.Deleted {
 		return nil, ErrKeyNotFound
 	}
 	if isExpired(meta, now) {
-		db.expireKeys([]string{string(key)})
+		db.expireKeys([][]byte{key})
 		return nil, ErrExpired
 	}
 	val, err := db.readValue(meta)
 	if err != nil {
 		if errors.Is(err, ErrExpired) {
-			db.expireKeys([]string{string(key)})
+			db.expireKeys([][]byte{key})
 		}
 		return nil, err
 	}
 	return val, nil
 }
 
+func (db *DB) Meta(key []byte) (RecordMeta, error) {
+	if db == nil {
+		return RecordMeta{}, ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	if len(key) == 0 {
+		return RecordMeta{}, ErrInvalidKey
+	}
+	now := time.Now()
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return RecordMeta{}, ErrClosed
+	}
+	meta, ok := db.indexGet(key)
+	db.mu.RUnlock()
+	if !ok || meta.Deleted {
+		return RecordMeta{}, ErrKeyNotFound
+	}
+	if isExpired(meta, now) {
+		db.expireKeys([][]byte{key})
+		return RecordMeta{}, ErrExpired
+	}
+	return meta, nil
+}
+
 func (db *DB) Delete(key []byte) error {
 	if db == nil {
 		return ErrClosed
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
 	if len(key) == 0 {
-		return ErrKeyNotFound
+		return ErrInvalidKey
 	}
 	if len(key) > db.opts.MaxKeySize {
 		return ErrOversized
@@ -351,11 +403,11 @@ func (db *DB) Delete(key []byte) error {
 
 	now := time.Now()
 	db.mu.RLock()
-	meta, ok := db.index[string(key)]
+	meta, ok := db.indexGet(key)
 	db.mu.RUnlock()
 	if !ok || meta.Deleted || isExpired(meta, now) {
 		if ok && isExpired(meta, now) {
-			db.expireKeys([]string{string(key)})
+			db.expireKeys([][]byte{key})
 		}
 		return ErrKeyNotFound
 	}
@@ -399,10 +451,11 @@ func (db *DB) Delete(key []byte) error {
 			Flags:   rec.Flags,
 		}
 		if err := index.WriteHint(db.active.hint, hintEntry); err != nil {
-			return err
-		}
-		if db.opts.HintFileSync && db.opts.SyncOnDelete {
-			_ = db.active.hint.Sync()
+			logf(db.opts.Logger, "bitgask: hint write failed: %v", err)
+		} else if db.opts.HintFileSync && db.opts.SyncOnDelete {
+			if err := db.active.hint.Sync(); err != nil {
+				logf(db.opts.Logger, "bitgask: hint sync failed: %v", err)
+			}
 		}
 	}
 	if db.opts.SyncOnDelete {
@@ -425,7 +478,7 @@ func (db *DB) Delete(key []byte) error {
 	db.stats.DeadBytes += int64(size)      // tombstone is dead data
 	db.stats.TotalBytes += int64(size)
 	db.stats.Keys--
-	db.index[string(key)] = deletedMeta
+	db.indexSet(key, deletedMeta)
 	return nil
 }
 
@@ -433,97 +486,279 @@ func (db *DB) Has(key []byte) (bool, error) {
 	if db == nil {
 		return false, ErrClosed
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	if len(key) == 0 {
+		return false, ErrInvalidKey
+	}
 	now := time.Now()
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
 		return false, ErrClosed
 	}
-	meta, ok := db.index[string(key)]
+	meta, ok := db.indexGet(key)
 	db.mu.RUnlock()
 	if !ok || meta.Deleted {
 		return false, nil
 	}
 	if isExpired(meta, now) {
-		db.expireKeys([]string{string(key)})
+		db.expireKeys([][]byte{key})
 		return false, nil
 	}
 	return true, nil
 }
 
-func (db *DB) Keys() ([][]byte, error) {
-	if db == nil {
-		return nil, ErrClosed
-	}
-	now := time.Now()
-	db.mu.RLock()
-	if db.closed {
-		db.mu.RUnlock()
-		return nil, ErrClosed
-	}
-	keys := make([][]byte, 0, len(db.index))
-	expired := make([]string, 0)
-	for k, m := range db.index {
-		if m.Deleted {
-			continue
-		}
-		if isExpired(m, now) {
-			expired = append(expired, k)
-			continue
-		}
-		keys = append(keys, []byte(k))
-	}
-	db.mu.RUnlock()
-	if len(expired) > 0 {
-		db.expireKeys(expired)
-	}
-	return keys, nil
+func (db *DB) Keys() <-chan []byte {
+	return db.KeysContext(context.Background())
 }
 
-func (db *DB) Scan(fn func(key, value []byte, meta RecordMeta) bool) error {
+func (db *DB) KeysContext(ctx context.Context) <-chan []byte {
+	ch := make(chan []byte)
+	go func() {
+		defer close(ch)
+		if db == nil {
+			return
+		}
+		db.opMu.RLock()
+		defer db.opMu.RUnlock()
+		entries, expired, err := db.snapshotEntries(nil, nil, nil, nil)
+		if err != nil {
+			return
+		}
+		if len(expired) > 0 {
+			db.expireKeys(expired)
+		}
+		for _, entry := range entries {
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- append([]byte(nil), entry.Key...):
+			}
+		}
+	}()
+	return ch
+}
+
+func (db *DB) IterKeys(ctx context.Context, fn func(key []byte) bool) error {
 	if db == nil {
 		return ErrClosed
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
 	now := time.Now()
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
 		return ErrClosed
 	}
-	keys := make([]string, 0, len(db.index))
-	metas := make([]RecordMeta, 0, len(db.index))
-	expired := make([]string, 0)
-	for k, m := range db.index {
-		if m.Deleted {
-			continue
+	expired := make([][]byte, 0)
+	var iterErr error
+	db.forEachIndex(nil, func(key []byte, meta RecordMeta) bool {
+		if meta.Deleted {
+			return true
 		}
-		if isExpired(m, now) {
-			expired = append(expired, k)
-			continue
+		if isExpired(meta, now) {
+			expired = append(expired, append([]byte(nil), key...))
+			return true
 		}
-		keys = append(keys, k)
-		metas = append(metas, m)
-	}
+		if err := ctx.Err(); err != nil {
+			iterErr = err
+			return false
+		}
+		if !fn(append([]byte(nil), key...)) {
+			return false
+		}
+		return true
+	})
 	db.mu.RUnlock()
 	if len(expired) > 0 {
 		db.expireKeys(expired)
 	}
-	for i, k := range keys {
-		val, err := db.readValue(metas[i])
+	return iterErr
+}
+
+func (db *DB) Iter(ctx context.Context, prefix []byte, fn func(key, value []byte, meta RecordMeta) bool) error {
+	if db == nil {
+		return ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+
+	now := time.Now()
+	fileIDs := make(map[uint32]struct{})
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return ErrClosed
+	}
+	db.forEachIndex(prefix, func(key []byte, meta RecordMeta) bool {
+		if meta.Deleted || isExpired(meta, now) {
+			return true
+		}
+		fileIDs[meta.FileID] = struct{}{}
+		return true
+	})
+	db.mu.RUnlock()
+	for id := range fileIDs {
+		if _, err := db.openDataFile(id); err != nil {
+			return err
+		}
+	}
+
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return ErrClosed
+	}
+	expired := make([][]byte, 0)
+	var iterErr error
+	db.forEachIndex(prefix, func(key []byte, meta RecordMeta) bool {
+		if meta.Deleted {
+			return true
+		}
+		if isExpired(meta, now) {
+			expired = append(expired, append([]byte(nil), key...))
+			return true
+		}
+		if err := ctx.Err(); err != nil {
+			iterErr = err
+			return false
+		}
+		val, err := db.readValue(meta)
+		if err != nil {
+			if errors.Is(err, ErrExpired) || errors.Is(err, ErrKeyNotFound) {
+				return true
+			}
+			iterErr = err
+			return false
+		}
+		if !fn(append([]byte(nil), key...), val, meta) {
+			return false
+		}
+		return true
+	})
+	db.mu.RUnlock()
+	if len(expired) > 0 {
+		db.expireKeys(expired)
+	}
+	return iterErr
+}
+
+func (db *DB) Scan(prefix []byte, fn func(key, value []byte, meta RecordMeta) bool) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	entries, expired, err := db.snapshotEntries(prefix, nil, nil, nil)
+	if err != nil {
+		return err
+	}
+	if len(expired) > 0 {
+		db.expireKeys(expired)
+	}
+	for _, entry := range entries {
+		val, err := db.readValue(entry.Meta)
 		if err != nil {
 			if errors.Is(err, ErrExpired) || errors.Is(err, ErrKeyNotFound) {
 				continue
 			}
 			return err
 		}
-		if !fn([]byte(k), val, metas[i]) {
+		if !fn(append([]byte(nil), entry.Key...), val, entry.Meta) {
 			return nil
 		}
 	}
 	return nil
 }
 
+func (db *DB) Range(start, end []byte, fn func(key, value []byte, meta RecordMeta) bool) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	entries, expired, err := db.snapshotEntries(nil, start, end, nil)
+	if err != nil {
+		return err
+	}
+	if len(expired) > 0 {
+		db.expireKeys(expired)
+	}
+	for _, entry := range entries {
+		val, err := db.readValue(entry.Meta)
+		if err != nil {
+			if errors.Is(err, ErrExpired) || errors.Is(err, ErrKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		if !fn(append([]byte(nil), entry.Key...), val, entry.Meta) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (db *DB) Sift(pred func(key []byte, meta RecordMeta) bool, fn func(key, value []byte, meta RecordMeta) bool) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	entries, expired, err := db.snapshotEntries(nil, nil, nil, pred)
+	if err != nil {
+		return err
+	}
+	if len(expired) > 0 {
+		db.expireKeys(expired)
+	}
+	for _, entry := range entries {
+		val, err := db.readValue(entry.Meta)
+		if err != nil {
+			if errors.Is(err, ErrExpired) || errors.Is(err, ErrKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		if !fn(append([]byte(nil), entry.Key...), val, entry.Meta) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (db *DB) Fold(init any, fn func(any, []byte, []byte, RecordMeta) any) (any, error) {
+	if db == nil {
+		return init, ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	acc := init
+	err := db.Scan(nil, func(key, value []byte, meta RecordMeta) bool {
+		acc = fn(acc, key, value, meta)
+		return true
+	})
+	return acc, err
+}
+
 func (db *DB) Sync() error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	return db.syncInternal()
+}
+
+func (db *DB) syncInternal() error {
 	if db == nil {
 		return ErrClosed
 	}
@@ -532,23 +767,234 @@ func (db *DB) Sync() error {
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}
-	if db.active != nil {
-		if err := db.active.file.Sync(); err != nil {
+	return db.syncLocked()
+}
+
+func (db *DB) syncLocked() error {
+	if db.active == nil {
+		return nil
+	}
+	if err := db.active.file.Sync(); err != nil {
+		return err
+	}
+	if db.opts.UseHintFiles && db.active.hint != nil && db.opts.HintFileSync {
+		if err := db.active.hint.Sync(); err != nil {
 			return err
-		}
-		if db.opts.UseHintFiles && db.active.hint != nil && db.opts.HintFileSync {
-			if err := db.active.hint.Sync(); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
+}
+
+func (db *DB) RunGC() (int, error) {
+	if db == nil {
+		return 0, ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	_, expired, err := db.snapshotEntries(nil, nil, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(expired) > 0 {
+		db.expireKeys(expired)
+	}
+	return len(expired), nil
+}
+
+func (db *DB) Reopen() error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.Lock()
+	defer db.opMu.Unlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
+
+	db.stopBackground()
+
+	db.mu.Lock()
+	for _, f := range db.dataFiles {
+		_ = f.Close()
+	}
+	if db.active != nil && db.active.hint != nil {
+		_ = db.active.hint.Close()
+	}
+	db.mu.Unlock()
+
+	var (
+		idx    keydir.Keydir
+		stats  Stats
+		lastID uint32
+		err    error
+	)
+	if db.opts.ValidateOnOpen {
+		idx, stats, lastID, err = loadFromData(db.dataDir, db.opts, false, false)
+	} else if db.opts.UseHintFiles {
+		idx, stats, lastID, err = loadFromHints(db.dataDir, db.opts)
+		if err != nil {
+			idx, stats, lastID, err = loadFromData(db.dataDir, db.opts, false, false)
+		}
+	} else {
+		idx, stats, lastID, err = loadFromData(db.dataDir, db.opts, false, false)
+	}
+	if err != nil {
+		db.startBackground()
+		return err
+	}
+	if lastID == 0 {
+		lastID = 1
+	}
+	active, err := openActiveFile(db.dataDir, lastID, db.opts)
+	if err != nil {
+		db.startBackground()
+		return err
+	}
+	if stats.DataFiles == 0 {
+		stats.DataFiles = 1
+	}
+
+	db.mu.Lock()
+	db.index = idx
+	db.dataFiles = map[uint32]*os.File{active.id: active.file}
+	db.active = active
+	db.stats = stats
+	db.mu.Unlock()
+
+	db.startBackground()
+	return nil
+}
+
+func (db *DB) Backup(dst string) error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
+	if err := db.syncLocked(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, db.opts.DirMode); err != nil {
+		return err
+	}
+	dstData := filepath.Join(dst, "data")
+	if err := os.MkdirAll(dstData, db.opts.DirMode); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(db.dataDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !file.IsDataFile(name) && !file.IsHintFile(name) && name != metaFileName {
+			continue
+		}
+		srcPath := filepath.Join(db.dataDir, name)
+		dstPath := filepath.Join(dstData, name)
+		if err := linkOrCopy(srcPath, dstPath, db.opts.FileMode); err != nil {
+			return err
+		}
+	}
+	if err := file.FsyncDir(dstData); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync backup data dir failed: %v", err)
+		return err
+	}
+	if err := file.FsyncDir(dst); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync backup dir failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (db *DB) DeleteAll() error {
+	if db == nil {
+		return ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
+
+	db.mu.Lock()
+	for _, f := range db.dataFiles {
+		_ = f.Close()
+	}
+	if db.active != nil && db.active.hint != nil {
+		_ = db.active.hint.Close()
+	}
+	db.mu.Unlock()
+
+	entries, err := os.ReadDir(db.dataDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if file.IsDataFile(name) || file.IsHintFile(name) {
+			_ = os.Remove(filepath.Join(db.dataDir, name))
+		}
+	}
+
+	active, err := openActiveFile(db.dataDir, 1, db.opts)
+	if err != nil {
+		return err
+	}
+	db.mu.Lock()
+	db.index = keydir.NewART()
+	db.dataFiles = map[uint32]*os.File{active.id: active.file}
+	db.active = active
+	db.stats = Stats{DataFiles: 1}
+	db.mu.Unlock()
+	if err := file.FsyncDir(db.dataDir); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync data dir failed after delete-all: %v", err)
+		return err
+	}
+	if err := file.FsyncDir(db.dir); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync db dir failed after delete-all: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (db *DB) Reclaimable() (int64, int64, float64) {
+	if db == nil {
+		return 0, 0, 0
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	total := db.stats.TotalBytes
+	dead := db.stats.DeadBytes
+	if total == 0 {
+		return dead, total, 0
+	}
+	return dead, total, float64(dead) / float64(total)
 }
 
 func (db *DB) Stats() Stats {
 	if db == nil {
 		return Stats{}
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.stats
@@ -558,6 +1004,12 @@ func (db *DB) CompactIfNeeded() (bool, error) {
 	if db == nil {
 		return false, ErrClosed
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	return db.compactIfNeededInternal()
+}
+
+func (db *DB) compactIfNeededInternal() (bool, error) {
 	db.mu.RLock()
 	total := db.stats.TotalBytes
 	dead := db.stats.DeadBytes
@@ -572,7 +1024,7 @@ func (db *DB) CompactIfNeeded() (bool, error) {
 	if ratio < db.opts.MergeTriggerRatio {
 		return false, nil
 	}
-	if err := db.Merge(); err != nil {
+	if err := db.mergeInternal(); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -582,6 +1034,12 @@ func (db *DB) Merge(opts ...MergeOptions) error {
 	if db == nil {
 		return ErrClosed
 	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	return db.mergeInternal(opts...)
+}
+
+func (db *DB) mergeInternal(opts ...MergeOptions) error {
 	opt := MergeOptions{}
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -625,17 +1083,21 @@ func (db *DB) rotateIfNeeded(nextSize int64) error {
 	if db.active.size+nextSize <= db.opts.MaxDataFileSize {
 		return nil
 	}
-	if err := db.active.file.Sync(); err != nil {
+	oldActive := db.active
+	if err := oldActive.file.Sync(); err != nil {
 		return err
 	}
-	if db.active.hint != nil && db.opts.UseHintFiles && db.opts.HintFileSync {
-		_ = db.active.hint.Sync()
+	if oldActive.hint != nil && db.opts.UseHintFiles && db.opts.HintFileSync {
+		_ = oldActive.hint.Sync()
 	}
-	_ = db.active.file.Close()
-	if db.active.hint != nil {
-		_ = db.active.hint.Close()
+	db.mu.Lock()
+	delete(db.dataFiles, oldActive.id)
+	db.mu.Unlock()
+	_ = oldActive.file.Close()
+	if oldActive.hint != nil {
+		_ = oldActive.hint.Close()
 	}
-	newID := db.active.id + 1
+	newID := oldActive.id + 1
 	active, err := openActiveFile(db.dataDir, newID, db.opts)
 	if err != nil {
 		return err
@@ -696,12 +1158,124 @@ func (db *DB) openDataFile(id uint32) (*os.File, error) {
 	return f, nil
 }
 
-func (db *DB) expireKeys(keys []string) {
+func (db *DB) indexGet(key []byte) (RecordMeta, bool) {
+	if db.index == nil {
+		return RecordMeta{}, false
+	}
+	val, ok := db.index.Get(key)
+	if !ok {
+		return RecordMeta{}, false
+	}
+	meta, ok := val.(RecordMeta)
+	if !ok {
+		return RecordMeta{}, false
+	}
+	return meta, true
+}
+
+func (db *DB) indexSet(key []byte, meta RecordMeta) {
+	if db.index == nil {
+		return
+	}
+	db.index.Set(key, meta)
+}
+
+func (db *DB) indexDelete(key []byte) {
+	if db.index == nil {
+		return
+	}
+	db.index.Delete(key)
+}
+
+func (db *DB) forEachIndex(prefix []byte, fn func(key []byte, meta RecordMeta) bool) {
+	if db.index == nil {
+		return
+	}
+	iter := func(key []byte, value interface{}) bool {
+		meta, ok := value.(RecordMeta)
+		if !ok {
+			return true
+		}
+		return fn(key, meta)
+	}
+	if len(prefix) == 0 {
+		db.index.Range(iter)
+		return
+	}
+	db.index.Prefix(prefix, iter)
+}
+
+type keydirEntry struct {
+	Key  []byte
+	Meta RecordMeta
+}
+
+func (db *DB) snapshotEntries(prefix, start, end []byte, pred func(key []byte, meta RecordMeta) bool) ([]keydirEntry, [][]byte, error) {
+	if db == nil {
+		return nil, nil, ErrClosed
+	}
+	now := time.Now()
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, nil, ErrClosed
+	}
+	entries := make([]keydirEntry, 0)
+	expired := make([][]byte, 0)
+	db.forEachIndex(prefix, func(key []byte, meta RecordMeta) bool {
+		if meta.Deleted {
+			return true
+		}
+		if isExpired(meta, now) {
+			expired = append(expired, append([]byte(nil), key...))
+			return true
+		}
+		if start != nil && bytes.Compare(key, start) < 0 {
+			return true
+		}
+		if end != nil && bytes.Compare(key, end) >= 0 {
+			return true
+		}
+		if pred != nil && !pred(key, meta) {
+			return true
+		}
+		entries = append(entries, keydirEntry{
+			Key:  append([]byte(nil), key...),
+			Meta: meta,
+		})
+		return true
+	})
+	db.mu.RUnlock()
+	return entries, expired, nil
+}
+
+func (db *DB) snapshotAll() ([]keydirEntry, error) {
+	if db == nil {
+		return nil, ErrClosed
+	}
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, ErrClosed
+	}
+	entries := make([]keydirEntry, 0)
+	db.forEachIndex(nil, func(key []byte, meta RecordMeta) bool {
+		entries = append(entries, keydirEntry{
+			Key:  append([]byte(nil), key...),
+			Meta: meta,
+		})
+		return true
+	})
+	db.mu.RUnlock()
+	return entries, nil
+}
+
+func (db *DB) expireKeys(keys [][]byte) {
 	now := time.Now()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	for _, k := range keys {
-		m, ok := db.index[k]
+		m, ok := db.indexGet(k)
 		if !ok {
 			continue
 		}
@@ -711,7 +1285,7 @@ func (db *DB) expireKeys(keys []string) {
 		if !isExpired(m, now) {
 			continue
 		}
-		delete(db.index, k)
+		db.indexDelete(k)
 		db.stats.Keys--
 		db.stats.DeadBytes += int64(m.Size)
 	}
@@ -724,7 +1298,9 @@ func (db *DB) mergeLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			_, _ = db.CompactIfNeeded()
+			if _, err := db.compactIfNeededInternal(); err != nil {
+				logf(db.opts.Logger, "bitgask: background merge failed: %v", err)
+			}
 		case <-db.mergeStop:
 			return
 		}
@@ -738,10 +1314,34 @@ func (db *DB) syncLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			_ = db.Sync()
+			if err := db.syncInternal(); err != nil {
+				logf(db.opts.Logger, "bitgask: background sync failed: %v", err)
+			}
 		case <-db.syncStop:
 			return
 		}
+	}
+}
+
+func (db *DB) stopBackground() {
+	close(db.mergeStop)
+	<-db.mergeDone
+	if db.opts.SyncInterval > 0 {
+		close(db.syncStop)
+		<-db.syncDone
+	}
+}
+
+func (db *DB) startBackground() {
+	db.mergeStop = make(chan struct{})
+	db.mergeDone = make(chan struct{})
+	db.syncStop = make(chan struct{})
+	db.syncDone = make(chan struct{})
+	go db.mergeLoop()
+	if db.opts.SyncInterval > 0 {
+		go db.syncLoop()
+	} else {
+		close(db.syncDone)
 	}
 }
 
@@ -753,13 +1353,10 @@ func (db *DB) runMerge() error {
 	}
 
 	now := time.Now()
-	// snapshot index
-	db.mu.RLock()
-	snapshot := make(map[string]RecordMeta, len(db.index))
-	for k, v := range db.index {
-		snapshot[k] = v
+	entries, err := db.snapshotAll()
+	if err != nil {
+		return err
 	}
-	db.mu.RUnlock()
 
 	mergeDir := filepath.Join(db.dir, "merge.tmp")
 	_ = os.RemoveAll(mergeDir)
@@ -777,9 +1374,10 @@ func (db *DB) runMerge() error {
 		return err
 	}
 
-	newIndex := make(map[string]RecordMeta, len(snapshot))
+	newIndex := keydir.NewART()
 	var newStats Stats
-	for k, meta := range snapshot {
+	for _, entry := range entries {
+		meta := entry.Meta
 		if meta.Deleted {
 			continue
 		}
@@ -796,7 +1394,7 @@ func (db *DB) runMerge() error {
 		rec := record.Record{
 			Timestamp: meta.Timestamp.UnixNano(),
 			ExpiresAt: unixNano(meta.ExpiresAt),
-			Key:       []byte(k),
+			Key:       entry.Key,
 			Value:     val,
 			Flags:     0,
 			Codec:     0,
@@ -817,10 +1415,10 @@ func (db *DB) runMerge() error {
 			Offset:    offset,
 			Size:      size,
 		}
-		newIndex[k] = newMeta
+		newIndex.Set(entry.Key, newMeta)
 		newStats.TotalBytes += int64(size)
 	}
-	newStats.Keys = len(newIndex)
+	newStats.Keys = newIndex.Len()
 	newStats.DeadBytes = 0
 	newStats.DataFiles = writer.files
 	newStats.LastMerge = time.Now()
@@ -839,6 +1437,14 @@ func (db *DB) runMerge() error {
 		return err
 	}
 	_ = os.RemoveAll(oldDir)
+	if err := file.FsyncDir(db.dir); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync db dir failed after merge: %v", err)
+		return err
+	}
+	if err := file.FsyncDir(db.dataDir); err != nil {
+		logf(db.opts.Logger, "bitgask: fsync data dir failed after merge: %v", err)
+		return err
+	}
 
 	// reopen active file
 	activeID := writer.fileID
@@ -864,7 +1470,7 @@ func (db *DB) runMerge() error {
 	return nil
 }
 
-func encodeWithOptions(rec record.Record, opts Options) ([]byte, error) {
+func encodeWithOptions(rec record.Record, opts config) ([]byte, error) {
 	// apply compression based on options
 	flags := rec.Flags
 	codecID := rec.Codec
@@ -884,7 +1490,7 @@ func encodeWithOptions(rec record.Record, opts Options) ([]byte, error) {
 	return record.Encode(rec)
 }
 
-func openActiveFile(dataDir string, id uint32, opts Options) (*dataFile, error) {
+func openActiveFile(dataDir string, id uint32, opts config) (*dataFile, error) {
 	path := filepath.Join(dataDir, file.DataFileName(id, opts.FileIDWidth))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, opts.FileMode)
 	if err != nil {
@@ -919,7 +1525,7 @@ func openActiveFile(dataDir string, id uint32, opts Options) (*dataFile, error) 
 	return &dataFile{id: id, file: f, hint: hint, size: stat.Size()}, nil
 }
 
-func writeMeta(dataDir string, opts Options) error {
+func writeMeta(dataDir string, opts config) error {
 	metaPath := filepath.Join(dataDir, metaFileName)
 	if _, err := os.Stat(metaPath); err == nil {
 		return nil
@@ -936,151 +1542,273 @@ func writeMeta(dataDir string, opts Options) error {
 	return os.WriteFile(metaPath, buf, opts.FileMode)
 }
 
-func loadFromHints(dataDir string, opts Options) (map[string]RecordMeta, Stats, uint32, error) {
-	files, err := listDataFiles(dataDir)
-	if err != nil {
-		return nil, Stats{}, 0, err
-	}
-	idx := make(map[string]RecordMeta)
-	var stats Stats
-	var lastID uint32
-	now := time.Now()
-	for _, id := range files {
-		lastID = id
-		hintPath := filepath.Join(dataDir, file.HintFileName(id, opts.FileIDWidth))
-		hintFile, err := os.Open(hintPath)
-		if err != nil {
-			return nil, Stats{}, 0, err
-		}
-		reader := bufio.NewReader(hintFile)
-		for {
-			entry, _, err := index.ReadHint(reader)
-			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-					break
-				}
-				_ = hintFile.Close()
-				return nil, Stats{}, 0, err
-			}
-			stats.TotalBytes += int64(entry.Size)
-			meta := RecordMeta{
-				ExpiresAt: timeFromUnixNano(entry.Expires),
-				Deleted:   entry.Flags&record.FlagDeleted != 0,
-				Timestamp: timeFromUnixNano(entry.TS),
-				FileID:    entry.FileID,
-				Offset:    entry.Offset,
-				Size:      entry.Size,
-			}
-			updateIndex(idx, &stats, entry.Key, meta, now)
-		}
-		_ = hintFile.Close()
-	}
-	stats.Keys = countLive(idx, now)
-	stats.DataFiles = len(files)
-	return idx, stats, lastID, nil
+type loadEntry struct {
+	key  []byte
+	meta RecordMeta
 }
 
-func loadFromData(dataDir string, opts Options, repair bool, rebuildHints bool) (map[string]RecordMeta, Stats, uint32, error) {
+type fileLoadResult struct {
+	id         uint32
+	entries    []loadEntry
+	totalBytes int64
+	err        error
+}
+
+func loadFromHints(dataDir string, opts config) (keydir.Keydir, Stats, uint32, error) {
 	files, err := listDataFiles(dataDir)
 	if err != nil {
 		return nil, Stats{}, 0, err
 	}
-	idx := make(map[string]RecordMeta)
+	idx := keydir.NewART()
 	var stats Stats
-	var lastID uint32
+	if len(files) == 0 {
+		return idx, stats, 0, nil
+	}
 	now := time.Now()
-	for _, id := range files {
-		lastID = id
-		path := filepath.Join(dataDir, file.DataFileName(id, opts.FileIDWidth))
-		f, err := os.OpenFile(path, os.O_RDWR, opts.FileMode)
-		if err != nil {
-			return nil, Stats{}, 0, err
+	results, err := loadHintResults(dataDir, files, opts)
+	if err != nil {
+		return nil, Stats{}, 0, err
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].id < results[j].id })
+	for _, res := range results {
+		stats.TotalBytes += res.totalBytes
+		for _, entry := range res.entries {
+			updateIndex(idx, &stats, entry.key, entry.meta, now)
 		}
-		var hintFile *os.File
-		if rebuildHints && opts.UseHintFiles {
-			hintPath := filepath.Join(dataDir, file.HintFileName(id, opts.FileIDWidth))
-			hintFile, err = os.OpenFile(hintPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, opts.FileMode)
-			if err != nil {
-				_ = f.Close()
-				return nil, Stats{}, 0, err
-			}
-		}
-		reader := bufio.NewReader(f)
-		var offset int64
-		for {
-			rec, size, err := record.DecodeFrom(reader)
-			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-					if repair {
-						_ = f.Truncate(offset)
-						break
-					}
-					_ = f.Close()
-					if hintFile != nil {
-						_ = hintFile.Close()
-					}
-					return nil, Stats{}, 0, ErrCorrupt
-				}
-				if errors.Is(err, record.ErrCorrupt) {
-					if repair {
-						_ = f.Truncate(offset)
-						break
-					}
-					_ = f.Close()
-					if hintFile != nil {
-						_ = hintFile.Close()
-					}
-					return nil, Stats{}, 0, ErrCorrupt
-				}
-				_ = f.Close()
-				if hintFile != nil {
-					_ = hintFile.Close()
-				}
-				return nil, Stats{}, 0, err
-			}
-			meta := RecordMeta{
-				ExpiresAt: timeFromUnixNano(rec.ExpiresAt),
-				Deleted:   rec.Flags&record.FlagDeleted != 0,
-				Timestamp: timeFromUnixNano(rec.Timestamp),
-				FileID:    id,
-				Offset:    offset,
-				Size:      uint32(size),
-			}
-			stats.TotalBytes += int64(size)
-			updateIndex(idx, &stats, rec.Key, meta, now)
-			if rebuildHints && opts.UseHintFiles && hintFile != nil {
-				hintEntry := index.HintEntry{
-					Key:     append([]byte(nil), rec.Key...),
-					FileID:  id,
-					Offset:  offset,
-					Size:    uint32(size),
-					TS:      rec.Timestamp,
-					Expires: rec.ExpiresAt,
-					Flags:   rec.Flags,
-				}
-				if err := index.WriteHint(hintFile, hintEntry); err != nil {
-					_ = f.Close()
-					_ = hintFile.Close()
-					return nil, Stats{}, 0, err
-				}
-			}
-			offset += int64(size)
-		}
-		if hintFile != nil {
-			_ = hintFile.Sync()
-			_ = hintFile.Close()
-		}
-		_ = f.Close()
 	}
 	stats.Keys = countLive(idx, now)
 	stats.DataFiles = len(files)
-	return idx, stats, lastID, nil
+	return idx, stats, files[len(files)-1], nil
+}
+
+func loadFromData(dataDir string, opts config, repair bool, rebuildHints bool) (keydir.Keydir, Stats, uint32, error) {
+	files, err := listDataFiles(dataDir)
+	if err != nil {
+		return nil, Stats{}, 0, err
+	}
+	idx := keydir.NewART()
+	var stats Stats
+	if len(files) == 0 {
+		return idx, stats, 0, nil
+	}
+	now := time.Now()
+	results, err := loadDataResults(dataDir, files, opts, repair, rebuildHints)
+	if err != nil {
+		return nil, Stats{}, 0, err
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].id < results[j].id })
+	for _, res := range results {
+		stats.TotalBytes += res.totalBytes
+		for _, entry := range res.entries {
+			updateIndex(idx, &stats, entry.key, entry.meta, now)
+		}
+	}
+	stats.Keys = countLive(idx, now)
+	stats.DataFiles = len(files)
+	return idx, stats, files[len(files)-1], nil
+}
+
+func loadHintResults(dataDir string, files []uint32, opts config) ([]fileLoadResult, error) {
+	concurrency := opts.IndexLoadConcurrency
+	if concurrency <= 1 || len(files) <= 1 {
+		results := make([]fileLoadResult, 0, len(files))
+		for _, id := range files {
+			res := loadHintFile(dataDir, id, opts)
+			if res.err != nil {
+				return nil, res.err
+			}
+			results = append(results, res)
+		}
+		return results, nil
+	}
+	results := make([]fileLoadResult, 0, len(files))
+	sem := make(chan struct{}, concurrency)
+	ch := make(chan fileLoadResult, len(files))
+	for _, id := range files {
+		sem <- struct{}{}
+		go func(fileID uint32) {
+			defer func() { <-sem }()
+			ch <- loadHintFile(dataDir, fileID, opts)
+		}(id)
+	}
+	var firstErr error
+	for range files {
+		res := <-ch
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+		}
+		results = append(results, res)
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+func loadDataResults(dataDir string, files []uint32, opts config, repair bool, rebuildHints bool) ([]fileLoadResult, error) {
+	concurrency := opts.IndexLoadConcurrency
+	if concurrency <= 1 || len(files) <= 1 {
+		results := make([]fileLoadResult, 0, len(files))
+		for _, id := range files {
+			res := loadDataFile(dataDir, id, opts, repair, rebuildHints)
+			if res.err != nil {
+				return nil, res.err
+			}
+			results = append(results, res)
+		}
+		return results, nil
+	}
+	results := make([]fileLoadResult, 0, len(files))
+	sem := make(chan struct{}, concurrency)
+	ch := make(chan fileLoadResult, len(files))
+	for _, id := range files {
+		sem <- struct{}{}
+		go func(fileID uint32) {
+			defer func() { <-sem }()
+			ch <- loadDataFile(dataDir, fileID, opts, repair, rebuildHints)
+		}(id)
+	}
+	var firstErr error
+	for range files {
+		res := <-ch
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
+		}
+		results = append(results, res)
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return results, nil
+}
+
+func loadHintFile(dataDir string, id uint32, opts config) fileLoadResult {
+	hintPath := filepath.Join(dataDir, file.HintFileName(id, opts.FileIDWidth))
+	hintFile, err := os.Open(hintPath)
+	if err != nil {
+		return fileLoadResult{id: id, err: err}
+	}
+	defer func() { _ = hintFile.Close() }()
+	dataPath := filepath.Join(dataDir, file.DataFileName(id, opts.FileIDWidth))
+	dataFile, err := os.Open(dataPath)
+	if err != nil {
+		logf(opts.Logger, "bitgask: hint validation failed opening data file %d: %v", id, err)
+		return fileLoadResult{id: id, err: err}
+	}
+	defer func() { _ = dataFile.Close() }()
+	reader := bufio.NewReader(hintFile)
+	entries := make([]loadEntry, 0)
+	var total int64
+	for {
+		entry, _, err := index.ReadHint(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			logf(opts.Logger, "bitgask: hint read failed for file %d: %v", id, err)
+			return fileLoadResult{id: id, err: err}
+		}
+		rec, _, err := record.ReadAt(dataFile, entry.Offset)
+		if err != nil {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: %v", id, entry.Offset, err)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if !bytes.Equal(rec.Key, entry.Key) {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: key mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		meta := RecordMeta{
+			ExpiresAt: timeFromUnixNano(entry.Expires),
+			Deleted:   entry.Flags&record.FlagDeleted != 0,
+			Timestamp: timeFromUnixNano(entry.TS),
+			FileID:    entry.FileID,
+			Offset:    entry.Offset,
+			Size:      entry.Size,
+		}
+		entries = append(entries, loadEntry{
+			key:  append([]byte(nil), entry.Key...),
+			meta: meta,
+		})
+		total += int64(entry.Size)
+	}
+	return fileLoadResult{id: id, entries: entries, totalBytes: total}
+}
+
+func loadDataFile(dataDir string, id uint32, opts config, repair bool, rebuildHints bool) fileLoadResult {
+	path := filepath.Join(dataDir, file.DataFileName(id, opts.FileIDWidth))
+	f, err := os.OpenFile(path, os.O_RDWR, opts.FileMode)
+	if err != nil {
+		return fileLoadResult{id: id, err: err}
+	}
+	defer func() { _ = f.Close() }()
+	var hintFile *os.File
+	if rebuildHints && opts.UseHintFiles {
+		hintPath := filepath.Join(dataDir, file.HintFileName(id, opts.FileIDWidth))
+		hintFile, err = os.OpenFile(hintPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, opts.FileMode)
+		if err != nil {
+			return fileLoadResult{id: id, err: err}
+		}
+		defer func() {
+			_ = hintFile.Sync()
+			_ = hintFile.Close()
+		}()
+	}
+	reader := bufio.NewReader(f)
+	var offset int64
+	entries := make([]loadEntry, 0)
+	var total int64
+	for {
+		rec, size, err := record.DecodeFrom(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, record.ErrCorrupt) {
+				if repair {
+					logf(opts.Logger, "bitgask: repair truncating file %d at offset %d", id, offset)
+					_ = f.Truncate(offset)
+					break
+				}
+				return fileLoadResult{id: id, err: ErrCorrupt}
+			}
+			return fileLoadResult{id: id, err: err}
+		}
+		meta := RecordMeta{
+			ExpiresAt: timeFromUnixNano(rec.ExpiresAt),
+			Deleted:   rec.Flags&record.FlagDeleted != 0,
+			Timestamp: timeFromUnixNano(rec.Timestamp),
+			FileID:    id,
+			Offset:    offset,
+			Size:      uint32(size),
+		}
+		entries = append(entries, loadEntry{
+			key:  append([]byte(nil), rec.Key...),
+			meta: meta,
+		})
+		total += int64(size)
+		if rebuildHints && opts.UseHintFiles && hintFile != nil {
+			hintEntry := index.HintEntry{
+				Key:     append([]byte(nil), rec.Key...),
+				FileID:  id,
+				Offset:  offset,
+				Size:    uint32(size),
+				TS:      rec.Timestamp,
+				Expires: rec.ExpiresAt,
+				Flags:   rec.Flags,
+			}
+			if err := index.WriteHint(hintFile, hintEntry); err != nil {
+				return fileLoadResult{id: id, err: err}
+			}
+		}
+		offset += int64(size)
+	}
+	return fileLoadResult{id: id, entries: entries, totalBytes: total}
 }
 
 func listDataFiles(dataDir string) ([]uint32, error) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -1103,11 +1831,19 @@ func listDataFiles(dataDir string) ([]uint32, error) {
 	return ids, nil
 }
 
-func updateIndex(idx map[string]RecordMeta, stats *Stats, key []byte, meta RecordMeta, now time.Time) {
-	k := string(key)
-	old, ok := idx[k]
+func updateIndex(idx keydir.Keydir, stats *Stats, key []byte, meta RecordMeta, now time.Time) {
+	oldVal, ok := idx.Get(key)
+	var old RecordMeta
+	if ok {
+		cast, castOk := oldVal.(RecordMeta)
+		if !castOk {
+			ok = false
+		} else {
+			old = cast
+		}
+	}
 	if ok && isExpired(old, now) {
-		delete(idx, k)
+		idx.Delete(key)
 		if !old.Deleted {
 			stats.Keys--
 		}
@@ -1121,7 +1857,7 @@ func updateIndex(idx map[string]RecordMeta, stats *Stats, key []byte, meta Recor
 			stats.Keys--
 		}
 		stats.DeadBytes += int64(meta.Size)
-		idx[k] = meta
+		idx.Set(key, meta)
 		return
 	}
 	if isExpired(meta, now) {
@@ -1130,29 +1866,34 @@ func updateIndex(idx map[string]RecordMeta, stats *Stats, key []byte, meta Recor
 			stats.Keys--
 		}
 		stats.DeadBytes += int64(meta.Size)
-		delete(idx, k)
+		idx.Delete(key)
 		return
 	}
 	if ok && !old.Deleted {
 		stats.DeadBytes += int64(old.Size)
 	}
-	idx[k] = meta
+	idx.Set(key, meta)
 	if !ok || old.Deleted {
 		stats.Keys++
 	}
 }
 
-func countLive(idx map[string]RecordMeta, now time.Time) int {
+func countLive(idx keydir.Keydir, now time.Time) int {
 	count := 0
-	for _, m := range idx {
-		if m.Deleted {
-			continue
+	idx.Range(func(_ []byte, value interface{}) bool {
+		meta, ok := value.(RecordMeta)
+		if !ok {
+			return true
 		}
-		if isExpired(m, now) {
-			continue
+		if meta.Deleted {
+			return true
+		}
+		if isExpired(meta, now) {
+			return true
 		}
 		count++
-	}
+		return true
+	})
 	return count
 }
 
@@ -1176,12 +1917,36 @@ func unixNano(t time.Time) int64 {
 
 type mergeWriter struct {
 	dataDir string
-	opts    Options
+	opts    config
 	fileID  uint32
 	file    *os.File
 	hint    *os.File
 	size    int64
 	files   int
+}
+
+func linkOrCopy(src, dst string, mode os.FileMode) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func (w *mergeWriter) open() error {

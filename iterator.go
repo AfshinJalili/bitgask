@@ -2,50 +2,28 @@ package bitgask
 
 import (
 	"errors"
-	"time"
 )
 
 type Iterator struct {
-	db     *DB
-	keys   []string
-	metas  []RecordMeta
-	idx    int
-	key    []byte
-	val    []byte
-	meta   RecordMeta
-	err    error
-	closed bool
+	db      *DB
+	entries []keydirEntry
+	idx     int
+	key     []byte
+	val     []byte
+	meta    RecordMeta
+	err     error
+	closed  bool
 }
 
-func (db *DB) NewIterator() (*Iterator, error) {
-	if db == nil {
-		return nil, ErrClosed
+func (db *DB) NewIterator(prefix []byte) (*Iterator, error) {
+	entries, expired, err := db.snapshotEntries(prefix, nil, nil, nil)
+	if err != nil {
+		return nil, err
 	}
-	now := time.Now()
-	db.mu.RLock()
-	if db.closed {
-		db.mu.RUnlock()
-		return nil, ErrClosed
-	}
-	keys := make([]string, 0, len(db.index))
-	metas := make([]RecordMeta, 0, len(db.index))
-	expired := make([]string, 0)
-	for k, m := range db.index {
-		if m.Deleted {
-			continue
-		}
-		if isExpired(m, now) {
-			expired = append(expired, k)
-			continue
-		}
-		keys = append(keys, k)
-		metas = append(metas, m)
-	}
-	db.mu.RUnlock()
 	if len(expired) > 0 {
 		db.expireKeys(expired)
 	}
-	return &Iterator{db: db, keys: keys, metas: metas, idx: -1}, nil
+	return &Iterator{db: db, entries: entries, idx: -1}, nil
 }
 
 func (it *Iterator) Next() bool {
@@ -54,12 +32,11 @@ func (it *Iterator) Next() bool {
 	}
 	for {
 		it.idx++
-		if it.idx >= len(it.keys) {
+		if it.idx >= len(it.entries) {
 			return false
 		}
-		key := it.keys[it.idx]
-		meta := it.metas[it.idx]
-		val, err := it.db.readValue(meta)
+		entry := it.entries[it.idx]
+		val, err := it.db.readValue(entry.Meta)
 		if err != nil {
 			if errors.Is(err, ErrExpired) || errors.Is(err, ErrKeyNotFound) {
 				continue
@@ -67,9 +44,9 @@ func (it *Iterator) Next() bool {
 			it.err = err
 			return false
 		}
-		it.key = []byte(key)
+		it.key = entry.Key
 		it.val = val
-		it.meta = meta
+		it.meta = entry.Meta
 		return true
 	}
 }
@@ -107,7 +84,6 @@ func (it *Iterator) Close() error {
 		return nil
 	}
 	it.closed = true
-	it.keys = nil
-	it.metas = nil
+	it.entries = nil
 	return nil
 }
