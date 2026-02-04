@@ -1427,13 +1427,46 @@ func (db *DB) runMerge() error {
 		return err
 	}
 
+	// Close open handles before rename (required on Windows).
+	oldActiveID := uint32(0)
+	db.mu.Lock()
+	if db.active != nil {
+		oldActiveID = db.active.id
+	}
+	for _, f := range db.dataFiles {
+		_ = f.Close()
+	}
+	if db.active != nil && db.active.hint != nil {
+		_ = db.active.hint.Close()
+	}
+	db.dataFiles = map[uint32]*os.File{}
+	db.active = nil
+	db.mu.Unlock()
+
 	oldDir := filepath.Join(db.dir, "data.old")
 	_ = os.RemoveAll(oldDir)
 	if err := os.Rename(db.dataDir, oldDir); err != nil {
+		// Best-effort reopen active file to keep DB usable
+		if oldActiveID != 0 {
+			if active, reopenErr := openActiveFile(db.dataDir, oldActiveID, db.opts); reopenErr == nil {
+				db.mu.Lock()
+				db.active = active
+				db.dataFiles[active.id] = active.file
+				db.mu.Unlock()
+			}
+		}
 		return err
 	}
 	if err := os.Rename(mergeDir, db.dataDir); err != nil {
 		_ = os.Rename(oldDir, db.dataDir)
+		if oldActiveID != 0 {
+			if active, reopenErr := openActiveFile(db.dataDir, oldActiveID, db.opts); reopenErr == nil {
+				db.mu.Lock()
+				db.active = active
+				db.dataFiles[active.id] = active.file
+				db.mu.Unlock()
+			}
+		}
 		return err
 	}
 	_ = os.RemoveAll(oldDir)
@@ -1454,12 +1487,6 @@ func (db *DB) runMerge() error {
 	}
 
 	db.mu.Lock()
-	for _, f := range db.dataFiles {
-		_ = f.Close()
-	}
-	if db.active != nil && db.active.hint != nil {
-		_ = db.active.hint.Close()
-	}
 	db.dataFiles = map[uint32]*os.File{active.id: active.file}
 	db.active = active
 	db.index = newIndex
