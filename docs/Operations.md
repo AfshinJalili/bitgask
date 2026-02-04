@@ -31,6 +31,13 @@ CRC32 covers the header plus key and value (excluding the CRC field).
 - Expired keys are removed from the in-memory index on access or via `RunGC`.
 - Merge drops expired entries.
 
+## Transactions
+- `Transaction()` creates a snapshot of the keydir and a private write buffer.
+- Reads inside a transaction see their own writes first (read-your-writes).
+- `Commit()` writes the batch to the log and swaps the index atomically for in-process readers.
+- Transactions are single-goroutine and use last-commit-wins for conflicts.
+- Crash atomicity is best-effort: partial batches may appear after recovery.
+
 ## Durability
 - By default, every `Put` and `Delete` is fsynced.
 - For higher throughput, disable per-write sync and set `WithSyncInterval`.

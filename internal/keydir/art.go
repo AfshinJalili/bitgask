@@ -38,3 +38,37 @@ func (a *ART) Prefix(prefix []byte, fn Iterator) {
 		return fn(node.Key(), node.Value())
 	})
 }
+
+type artSnapshot struct {
+	tree art.Tree
+}
+
+func (a *ART) Snapshot() Snapshot {
+	copyTree := art.New()
+	a.tree.ForEach(func(node art.Node) bool {
+		k := append([]byte(nil), node.Key()...)
+		copyTree.Insert(k, node.Value())
+		return true
+	})
+	return &artSnapshot{tree: copyTree}
+}
+
+func (s *artSnapshot) Get(key []byte) (interface{}, bool) {
+	return s.tree.Search(key)
+}
+
+func (s *artSnapshot) Len() int {
+	return s.tree.Size()
+}
+
+func (s *artSnapshot) Range(fn Iterator) {
+	s.tree.ForEach(func(node art.Node) bool {
+		return fn(node.Key(), node.Value())
+	})
+}
+
+func (s *artSnapshot) Prefix(prefix []byte, fn Iterator) {
+	s.tree.ForEachPrefix(prefix, func(node art.Node) bool {
+		return fn(node.Key(), node.Value())
+	})
+}

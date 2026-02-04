@@ -7,6 +7,9 @@ This document describes the public Go API for `github.com/AfshinJalili/bitgask`.
 ### DB
 The main database handle. Safe for concurrent use. Writes are serialized internally.
 
+### Txn
+Transaction handle created by `db.Transaction()`. Transactions are single-goroutine, provide snapshot isolation and read-your-writes, and commit as a batch. Conflicts use last-commit-wins semantics.
+
 ### RecordMeta
 ```go
 type RecordMeta struct {
@@ -92,6 +95,12 @@ func (db *DB) Reopen() error
 ```
 Rebuilds the keydir and reopens files. Blocks other operations while running.
 
+### Transaction
+```go
+func (db *DB) Transaction() *Txn
+```
+Returns a new transaction snapshot. Transactions are not safe for concurrent use.
+
 ## CRUD Operations
 
 ### Put
@@ -129,6 +138,39 @@ Writes a tombstone. Returns `ErrKeyNotFound` if the key does not exist.
 func (db *DB) Has(key []byte) (bool, error)
 ```
 Returns `true` if the key exists and is not expired.
+
+## Transaction Operations
+
+### Commit / Discard
+```go
+func (t *Txn) Commit() error
+func (t *Txn) Discard()
+```
+`Commit` writes the batch and makes changes visible atomically to in-process readers. `Discard` releases the transaction without committing.
+
+### Txn Put / PutWithTTL
+```go
+func (t *Txn) Put(key, value []byte) error
+func (t *Txn) PutWithTTL(key, value []byte, ttl time.Duration) error
+```
+Queue writes in the transaction. Reads within the transaction see these writes immediately.
+
+### Txn Get / Has / Delete
+```go
+func (t *Txn) Get(key []byte) ([]byte, error)
+func (t *Txn) Has(key []byte) (bool, error)
+func (t *Txn) Delete(key []byte) error
+```
+Reads are served from the transaction cache first, then the snapshot.
+
+### Txn Iteration
+```go
+func (t *Txn) IterKeys(ctx context.Context, fn func(key []byte) bool) error
+func (t *Txn) Iter(ctx context.Context, prefix []byte, fn func(key, value []byte, meta RecordMeta) bool) error
+func (t *Txn) Scan(prefix []byte, fn func(key, value []byte, meta RecordMeta) bool) error
+func (t *Txn) Range(start, end []byte, fn func(key, value []byte, meta RecordMeta) bool) error
+```
+Iterates over the transaction view (snapshot + pending writes). `Range` uses byte-wise ordering.
 
 ## Iteration
 

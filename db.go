@@ -957,7 +957,7 @@ func (db *DB) DeleteAll() error {
 		return err
 	}
 	db.mu.Lock()
-	db.index = keydir.NewART()
+	db.index = keydir.NewRadix()
 	db.dataFiles = map[uint32]*os.File{active.id: active.file}
 	db.active = active
 	db.stats = Stats{DataFiles: 1}
@@ -1374,7 +1374,7 @@ func (db *DB) runMerge() error {
 		return err
 	}
 
-	newIndex := keydir.NewART()
+	newIndex := keydir.NewRadix()
 	var newStats Stats
 	for _, entry := range entries {
 		meta := entry.Meta
@@ -1586,7 +1586,7 @@ func loadFromHints(dataDir string, opts config) (keydir.Keydir, Stats, uint32, e
 	if err != nil {
 		return nil, Stats{}, 0, err
 	}
-	idx := keydir.NewART()
+	idx := keydir.NewRadix()
 	var stats Stats
 	if len(files) == 0 {
 		return idx, stats, 0, nil
@@ -1613,7 +1613,7 @@ func loadFromData(dataDir string, opts config, repair bool, rebuildHints bool) (
 	if err != nil {
 		return nil, Stats{}, 0, err
 	}
-	idx := keydir.NewART()
+	idx := keydir.NewRadix()
 	var stats Stats
 	if len(files) == 0 {
 		return idx, stats, 0, nil

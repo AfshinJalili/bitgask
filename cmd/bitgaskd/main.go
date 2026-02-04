@@ -56,17 +56,7 @@ func (c *serverConfig) options() []bitgask.Option {
 
 func main() {
 	cfg := &serverConfig{}
-	flag.StringVar(&cfg.dir, "dir", "./data", "database directory")
-	flag.StringVar(&cfg.addr, "addr", "127.0.0.1:6380", "listen address")
-	flag.IntVar(&cfg.maxKey, "max-key", 64, "max key size in bytes")
-	flag.IntVar(&cfg.maxValue, "max-value", 64<<10, "max value size in bytes")
-	flag.DurationVar(&cfg.defaultTTL, "ttl", 0, "default TTL")
-	flag.BoolVar(&cfg.syncWrites, "sync", true, "fsync on writes")
-	flag.DurationVar(&cfg.syncInterval, "sync-interval", 0, "sync interval")
-	flag.DurationVar(&cfg.mergeInterval, "merge-interval", 10*time.Minute, "merge interval")
-	flag.StringVar(&cfg.compression, "compression", "snappy", "compression (snappy|none)")
-	flag.BoolVar(&cfg.hintFiles, "hint-files", true, "write hint files")
-	flag.BoolVar(&cfg.hintSync, "hint-sync", true, "fsync hint files")
+	addFlags(flag.CommandLine, cfg)
 	flag.Parse()
 
 	db, err := bitgask.Open(cfg.dir, cfg.options()...)
@@ -300,6 +290,20 @@ func main() {
 	if err := redcon.ListenAndServe(cfg.addr, handler, accept, closed); err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+}
+
+func addFlags(fs *flag.FlagSet, cfg *serverConfig) {
+	fs.StringVar(&cfg.dir, "dir", "./data", "database directory")
+	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:6380", "listen address")
+	fs.IntVar(&cfg.maxKey, "max-key", 64, "max key size in bytes")
+	fs.IntVar(&cfg.maxValue, "max-value", 64<<10, "max value size in bytes")
+	fs.DurationVar(&cfg.defaultTTL, "ttl", 0, "default TTL")
+	fs.BoolVar(&cfg.syncWrites, "sync", true, "fsync on writes")
+	fs.DurationVar(&cfg.syncInterval, "sync-interval", 0, "sync interval")
+	fs.DurationVar(&cfg.mergeInterval, "merge-interval", 10*time.Minute, "merge interval")
+	fs.StringVar(&cfg.compression, "compression", "snappy", "compression (snappy|none)")
+	fs.BoolVar(&cfg.hintFiles, "hint-files", true, "write hint files")
+	fs.BoolVar(&cfg.hintSync, "hint-sync", true, "fsync hint files")
 }
 
 func collectKeys(db *bitgask.DB, pattern string) [][]byte {

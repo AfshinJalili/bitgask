@@ -105,6 +105,21 @@ _ = db.Iter(context.Background(), []byte("user:"), func(key, value []byte, meta 
 })
 ```
 
+### Transactions
+```go
+txn := db.Transaction()
+defer txn.Discard()
+
+_ = txn.Put([]byte("k"), []byte("v1"))
+val, _ := txn.Get([]byte("k")) // read-your-writes
+_ = val
+
+if err := txn.Commit(); err != nil {
+	log.Fatal(err)
+}
+```
+Transactions are single-goroutine and use last-commit-wins for conflicts. Commit durability follows the same sync options as `Put`/`Delete`.
+
 ## Durability
 By default each `Put` and `Delete` is fsynced for strong durability. To trade durability for throughput, disable per-write sync and enable periodic syncing with `WithSyncInterval`.
 
