@@ -6,7 +6,7 @@ require (
 	github.com/golang/snappy v0.0.4
 	github.com/plar/go-adaptive-radix-tree v1.0.4
 	github.com/tidwall/redcon v1.6.0
-	golang.org/x/sys v0.38.0
+	golang.org/x/sys v0.30.0
 )
 
 require (
