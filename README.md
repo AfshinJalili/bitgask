@@ -159,7 +159,7 @@ redis-cli -p 6380 GET hello
 ## Limitations and Non-goals
 - Single-process access enforced by a lock file.
 - Entire keydir is in memory, so RAM scales with key count.
-- No transactions or multi-key atomicity.
+- No multi-key atomicity across separate transactions.
 - `bitgaskd` is not a full Redis implementation.
 
 ## Documentation

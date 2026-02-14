@@ -292,7 +292,9 @@ func (db *DB) putWithTTL(key, value []byte, ttlVal time.Duration) error {
 		}
 	}
 	if db.opts.SyncOnPut {
-		_ = db.active.file.Sync()
+		if err := syncDataFile(db.active.file); err != nil {
+			return err
+		}
 	}
 
 	meta := RecordMeta{
@@ -459,7 +461,9 @@ func (db *DB) Delete(key []byte) error {
 		}
 	}
 	if db.opts.SyncOnDelete {
-		_ = db.active.file.Sync()
+		if err := syncDataFile(db.active.file); err != nil {
+			return err
+		}
 	}
 
 	deletedMeta := RecordMeta{
@@ -1330,6 +1334,15 @@ func (db *DB) stopBackground() {
 		close(db.syncStop)
 		<-db.syncDone
 	}
+}
+
+var syncDataFileHook func(*os.File) error
+
+func syncDataFile(f *os.File) error {
+	if syncDataFileHook != nil {
+		return syncDataFileHook(f)
+	}
+	return f.Sync()
 }
 
 func (db *DB) startBackground() {
