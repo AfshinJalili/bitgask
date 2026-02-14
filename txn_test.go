@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
@@ -218,6 +219,26 @@ func TestTxnCommitSync(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected sync hook once, got %d", calls)
+	}
+}
+
+func TestTxnCommitSyncError(t *testing.T) {
+	db := OpenTestDB(t, "", WithSyncOnPut(true))
+	defer db.Close()
+
+	errSync := errors.New("sync failed")
+	syncDataFileHook = func(_ *os.File) error { return errSync }
+	defer func() { syncDataFileHook = nil }()
+
+	txn := db.Transaction()
+	if err := txn.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("txn put: %v", err)
+	}
+	if err := txn.Commit(); !errors.Is(err, errSync) {
+		t.Fatalf("expected sync error, got %v", err)
+	}
+	if _, err := db.Get([]byte("k")); !errorsIs(err, ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound after failed commit, got %v", err)
 	}
 }
 

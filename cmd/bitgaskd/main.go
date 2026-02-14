@@ -13,7 +13,7 @@ import (
 	"github.com/tidwall/redcon"
 )
 
-// Set via goreleaser ldflags.
+// Set via GoReleaser ldflags.
 var (
 	version = "dev"
 	commit  = "none"

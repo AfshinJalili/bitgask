@@ -418,7 +418,9 @@ func (t *Txn) Commit() error {
 		}
 	}
 	if needSync {
-		_ = t.db.active.file.Sync()
+		if err := syncDataFile(t.db.active.file); err != nil {
+			return err
+		}
 		if txnSyncHook != nil {
 			txnSyncHook()
 		}
