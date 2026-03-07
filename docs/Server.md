@@ -10,6 +10,7 @@ go install github.com/AfshinJalili/bitgask/cmd/bitgaskd@latest
 ## Run
 ```bash
 bitgaskd -dir ./data -addr 127.0.0.1:6380
+bitgaskd -version
 ```
 
 ## Client Example
@@ -21,6 +22,7 @@ redis-cli -p 6380 GET hello
 ## Server Flags
 - `-dir` database directory
 - `-addr` listen address (default `127.0.0.1:6380`)
+- `-version` print build metadata and exit
 - `-max-key` maximum key size in bytes
 - `-max-value` maximum value size in bytes
 - `-ttl` default TTL

@@ -133,6 +133,12 @@ func (db *DB) Delete(key []byte) error
 ```
 Writes a tombstone. Returns `ErrKeyNotFound` if the key does not exist.
 
+### Expire
+```go
+func (db *DB) Expire(key []byte, ttl time.Duration) (bool, error)
+```
+Atomically updates key expiry. Returns `false, nil` when the key does not exist. A non-positive `ttl` deletes the key.
+
 ### Has
 ```go
 func (db *DB) Has(key []byte) (bool, error)

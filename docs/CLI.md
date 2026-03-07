@@ -102,3 +102,8 @@ bitgask validate -dir ./data
 ```bash
 bitgask repair -dir ./data
 ```
+
+### version
+```bash
+bitgask version
+```

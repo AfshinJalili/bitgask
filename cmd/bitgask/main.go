@@ -18,6 +18,10 @@ var (
 	date    = "unknown"
 )
 
+func buildInfo() string {
+	return fmt.Sprintf("version=%s commit=%s date=%s", version, commit, date)
+}
+
 type commonFlags struct {
 	dir            string
 	maxKey         int
@@ -112,6 +116,8 @@ func main() {
 		err = cmdValidate(args)
 	case "repair":
 		err = cmdRepair(args)
+	case "version":
+		err = cmdVersion()
 	default:
 		usage()
 		os.Exit(2)
@@ -125,11 +131,16 @@ func main() {
 func usage() {
 	exe := filepath.Base(os.Args[0])
 	fmt.Fprintf(os.Stderr, "usage: %s <command> [args]\n", exe)
-	fmt.Fprintln(os.Stderr, "commands: get, put, del, exists, keys, scan, stats, reclaimable, merge, gc, backup, delete-all, reopen, validate, repair")
+	fmt.Fprintln(os.Stderr, "commands: get, put, del, exists, keys, scan, stats, reclaimable, merge, gc, backup, delete-all, reopen, validate, repair, version")
 }
 
 func openDB(cfg *commonFlags) (*bitgask.DB, error) {
 	return bitgask.Open(cfg.dir, cfg.options()...)
+}
+
+func cmdVersion() error {
+	_, err := fmt.Fprintln(os.Stdout, buildInfo())
+	return err
 }
 
 func cmdGet(args []string) error {

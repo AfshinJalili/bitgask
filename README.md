@@ -4,7 +4,7 @@ Production-grade Bitcask-style log-structured key-value store in Go.
 
 ## Features
 - Append-only data files
-- In-memory keydir using an adaptive radix tree
+- In-memory keydir using a radix tree
 - CRC integrity checks
 - Optional Snappy compression
 - Per-entry TTL
@@ -124,7 +124,7 @@ Transactions are single-goroutine and use last-commit-wins for conflicts. Commit
 By default each `Put` and `Delete` is fsynced for strong durability. To trade durability for throughput, disable per-write sync and enable periodic syncing with `WithSyncInterval`.
 
 ## Compaction
-Compaction (merge) rewrites live keys into new data files and removes tombstones and expired entries. It runs in the background and can be triggered manually with `db.Merge()`.
+Compaction (merge) rewrites live keys into new data files and removes tombstones and expired entries. It runs in the background, can be triggered manually with `db.Merge()`, and can fan out record loading/encoding work with `WithMergeConcurrency`.
 
 ## CLI Quickstart
 ```bash
@@ -159,8 +159,9 @@ redis-cli -p 6380 GET hello
 ## Limitations and Non-goals
 - Single-process access enforced by a lock file.
 - Entire keydir is in memory, so RAM scales with key count.
-- No multi-key atomicity across separate transactions.
+- Transactions are single-process, single-goroutine snapshots with last-commit-wins conflict handling; there is no multi-key atomicity across separate transactions or serializable cross-process coordination.
 - `bitgaskd` is not a full Redis implementation.
+- `bitgaskd` `KEYS` and `SCAN` materialize a key snapshot in memory and are intended for modest keyspaces.
 
 ## Documentation
 - API reference: docs/API.md

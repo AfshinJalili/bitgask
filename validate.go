@@ -54,7 +54,11 @@ func Validate(path string, opts ...Option) (Report, error) {
 		for {
 			rec, _, err := record.DecodeFrom(reader)
 			if err != nil {
-				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					report.CorruptRecords++
 					break
 				}
 				if errors.Is(err, record.ErrCorrupt) {
@@ -83,7 +87,11 @@ func Validate(path string, opts ...Option) (Report, error) {
 			for {
 				entry, _, err := index.ReadHint(reader)
 				if err != nil {
-					if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					if errors.Is(err, io.ErrUnexpectedEOF) {
+						report.Errors = append(report.Errors, err)
 						break
 					}
 					report.Errors = append(report.Errors, err)

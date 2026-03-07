@@ -21,7 +21,7 @@ All configuration is provided through `Option` functions.
 | `WithMergeMinTotal(int64)` | `64 MiB` | Minimum data size before automatic merge can run. |
 | `WithMergeInterval(time.Duration)` | `10m` | Background merge interval. |
 | `WithMergeOnOpen(bool)` | `false` | Run merge on `Open` when thresholds are exceeded. |
-| `WithMergeConcurrency(int)` | `1` | Merge concurrency setting. |
+| `WithMergeConcurrency(int)` | `1` | Number of record readers/encoders used during merge. Output writes remain serialized. |
 | `WithMergeMaxFileSize(int64)` | `MaxDataFileSize` | Maximum size of merged data files. |
 | `WithHintFiles(bool)` | `true` | Enable hint files for faster open. |
 | `WithHintFileSync(bool)` | `true` | Fsync hint files on write when per-write sync is enabled. |
@@ -55,6 +55,9 @@ Hints are best-effort and validated on load. If hint files are missing or corrup
 
 ## Locking
 A lock file is acquired in the database root to prevent multiple processes from writing at the same time. Use `WithLockTimeout` to wait for the lock.
+
+## Merge Concurrency
+`WithMergeConcurrency(n)` controls how many records can be loaded and encoded in parallel during merge. It does not make foreground writes concurrent; the merged output is still written by a single writer.
 
 ## Validate-on-Open
 `WithValidateOnOpen(true)` skips hints and scans the data files at startup for integrity verification.

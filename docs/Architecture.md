@@ -1,12 +1,12 @@
 # Architecture
 
-Bitgask is a Bitcask-style log-structured key-value store. It appends records to immutable data files and maintains an in-memory keydir (adaptive radix tree) that points to the latest record for each key.
+Bitgask is a Bitcask-style log-structured key-value store. It appends records to immutable data files and maintains an in-memory keydir (radix tree) that points to the latest record for each key.
 
 ## Components
 - Data files: append-only `.data` files for all writes.
 - Hint files: `.hint` files that accelerate startup by storing keydir entries.
-- Keydir: in-memory map from key to record metadata.
-- Merge: background compaction that rewrites live records.
+- Keydir: in-memory radix tree from key to record metadata.
+- Merge: background compaction that rewrites live records. Value loading and encoding can run concurrently; output writes remain serialized.
 
 ## Write Path
 1. Encode record with CRC and optional compression.
@@ -44,7 +44,7 @@ Bitgask is a Bitcask-style log-structured key-value store. It appends records to
 flowchart TD
   A["Put/Delete"] --> B["Encode record"]
   B --> C["Append to active .data"]
-  C --> D["Update keydir (ART)"]
+  C --> D["Update keydir (radix)"]
   D --> E["Write hint entry (optional)"]
   E --> F["Sync if configured"]
 

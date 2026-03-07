@@ -70,6 +70,49 @@ func TestServerBasicCommands(t *testing.T) {
 	_ = cmd.Wait()
 }
 
+func TestServerScanRejectsInvalidCountWithoutCrashing(t *testing.T) {
+	dir := t.TempDir()
+	addr := freeAddr(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("wd: %v", err)
+	}
+	if filepath.Base(wd) != "bitgaskd" {
+		wd = filepath.Join(wd, "cmd", "bitgaskd")
+	}
+
+	bin := buildServerBinary(t, wd)
+	cmd := exec.CommandContext(ctx, bin, "-dir", dir, "-addr", addr)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	conn := waitForConn(t, addr)
+	defer conn.Close()
+	rd := bufio.NewReader(conn)
+
+	if err := writeRESP(conn, "SCAN", "0", "COUNT", "-1"); err != nil {
+		t.Fatalf("scan write: %v", err)
+	}
+	if line := readLine(t, rd); line != "-ERR invalid COUNT" {
+		t.Fatalf("unexpected scan error: %s", line)
+	}
+
+	if err := writeRESP(conn, "PING"); err != nil {
+		t.Fatalf("ping write: %v", err)
+	}
+	if line := readLine(t, rd); line != "+PONG" {
+		t.Fatalf("unexpected ping response after invalid scan: %s", line)
+	}
+}
+
 func buildServerBinary(t *testing.T, wd string) string {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "bitgaskd")

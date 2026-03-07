@@ -20,9 +20,14 @@ var (
 	date    = "unknown"
 )
 
+func buildInfo() string {
+	return fmt.Sprintf("version=%s commit=%s date=%s", version, commit, date)
+}
+
 type serverConfig struct {
 	dir           string
 	addr          string
+	showVersion   bool
 	maxKey        int
 	maxValue      int
 	defaultTTL    time.Duration
@@ -58,6 +63,10 @@ func main() {
 	cfg := &serverConfig{}
 	addFlags(flag.CommandLine, cfg)
 	flag.Parse()
+	if cfg.showVersion {
+		fmt.Println(buildInfo())
+		return
+	}
 
 	db, err := bitgask.Open(cfg.dir, cfg.options()...)
 	if err != nil {
@@ -185,51 +194,13 @@ func main() {
 				conn.WriteBulk(k)
 			}
 		case "SCAN":
-			if len(cmd.Args) < 2 {
-				conn.WriteError("ERR wrong number of arguments for SCAN")
-				return
-			}
-			cursor, err := strconv.Atoi(string(cmd.Args[1]))
+			cursor, pattern, count, err := parseScanArgs(cmd.Args)
 			if err != nil {
-				conn.WriteError("ERR invalid cursor")
+				conn.WriteError(err.Error())
 				return
-			}
-			pattern := "*"
-			count := 10
-			if len(cmd.Args) > 2 {
-				if (len(cmd.Args)-2)%2 != 0 {
-					conn.WriteError("ERR syntax error")
-					return
-				}
-				for i := 2; i < len(cmd.Args); i += 2 {
-					switch strings.ToUpper(string(cmd.Args[i])) {
-					case "MATCH":
-						pattern = string(cmd.Args[i+1])
-					case "COUNT":
-						parsed, err := strconv.Atoi(string(cmd.Args[i+1]))
-						if err != nil {
-							conn.WriteError("ERR invalid COUNT")
-							return
-						}
-						count = parsed
-					default:
-						conn.WriteError("ERR unsupported option")
-						return
-					}
-				}
 			}
 			keys := collectKeys(db, pattern)
-			if cursor < 0 || cursor >= len(keys) {
-				cursor = 0
-			}
-			end := cursor + count
-			next := 0
-			if end < len(keys) {
-				next = end
-			} else {
-				end = len(keys)
-			}
-			batch := keys[cursor:end]
+			batch, next := scanBatch(keys, cursor, count)
 			conn.WriteArray(2)
 			conn.WriteBulkString(strconv.Itoa(next))
 			conn.WriteArray(len(batch))
@@ -295,6 +266,7 @@ func main() {
 func addFlags(fs *flag.FlagSet, cfg *serverConfig) {
 	fs.StringVar(&cfg.dir, "dir", "./data", "database directory")
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:6380", "listen address")
+	fs.BoolVar(&cfg.showVersion, "version", false, "print build version and exit")
 	fs.IntVar(&cfg.maxKey, "max-key", 64, "max key size in bytes")
 	fs.IntVar(&cfg.maxValue, "max-value", 64<<10, "max value size in bytes")
 	fs.DurationVar(&cfg.defaultTTL, "ttl", 0, "default TTL")
@@ -343,19 +315,64 @@ func ttlForKey(db *bitgask.DB, key []byte, unit time.Duration) int {
 }
 
 func setExpire(db *bitgask.DB, key []byte, ttl time.Duration) int {
-	val, err := db.Get(key)
+	ok, err := db.Expire(key, ttl)
 	if err != nil {
-		if err == bitgask.ErrKeyNotFound || err == bitgask.ErrExpired {
-			return 0
-		}
 		return 0
 	}
-	if ttl <= 0 {
-		_ = db.Delete(key)
+	if ok {
 		return 1
 	}
-	if err := db.PutWithTTL(key, val, ttl); err != nil {
-		return 0
+	return 0
+}
+
+func parseScanArgs(args [][]byte) (int, string, int, error) {
+	if len(args) < 2 {
+		return 0, "", 0, fmt.Errorf("ERR wrong number of arguments for SCAN")
 	}
-	return 1
+	cursor, err := strconv.Atoi(string(args[1]))
+	if err != nil {
+		return 0, "", 0, fmt.Errorf("ERR invalid cursor")
+	}
+	pattern := "*"
+	count := 10
+	if len(args) == 2 {
+		return cursor, pattern, count, nil
+	}
+	if (len(args)-2)%2 != 0 {
+		return 0, "", 0, fmt.Errorf("ERR syntax error")
+	}
+	for i := 2; i < len(args); i += 2 {
+		switch strings.ToUpper(string(args[i])) {
+		case "MATCH":
+			pattern = string(args[i+1])
+		case "COUNT":
+			parsed, err := strconv.Atoi(string(args[i+1]))
+			if err != nil || parsed <= 0 {
+				return 0, "", 0, fmt.Errorf("ERR invalid COUNT")
+			}
+			count = parsed
+		default:
+			return 0, "", 0, fmt.Errorf("ERR unsupported option")
+		}
+	}
+	return cursor, pattern, count, nil
+}
+
+func scanBatch(keys [][]byte, cursor, count int) ([][]byte, int) {
+	if cursor < 0 || cursor >= len(keys) {
+		cursor = 0
+	}
+	if count <= 0 {
+		return keys[:0], 0
+	}
+	remaining := len(keys) - cursor
+	if count > remaining {
+		count = remaining
+	}
+	end := cursor + count
+	next := 0
+	if end < len(keys) {
+		next = end
+	}
+	return keys[cursor:end], next
 }

@@ -265,6 +265,61 @@ func TestHintCorruptionFallback(t *testing.T) {
 	}
 }
 
+func TestHintMetadataCorruptionFallback(t *testing.T) {
+	logger := &bufferLogger{}
+	dir := t.TempDir()
+	db, err := Open(dir, WithLogger(logger))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Put([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	hintPath := filepath.Join(dir, "data", "000000001.hint")
+	f, err := os.OpenFile(hintPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open hint: %v", err)
+	}
+	var lenBuf [4]byte
+	if _, err := f.ReadAt(lenBuf[:], 0); err != nil {
+		_ = f.Close()
+		t.Fatalf("read hint: %v", err)
+	}
+	keyLen := binary.LittleEndian.Uint32(lenBuf[:])
+	flagOffset := int64(36 + keyLen)
+	b := []byte{0}
+	if _, err := f.ReadAt(b, flagOffset); err != nil {
+		_ = f.Close()
+		t.Fatalf("read flag byte: %v", err)
+	}
+	b[0] ^= 0x01
+	if _, err := f.WriteAt(b, flagOffset); err != nil {
+		_ = f.Close()
+		t.Fatalf("write flag byte: %v", err)
+	}
+	_ = f.Close()
+
+	db, err = Open(dir, WithLogger(logger))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	val, err := db.Get([]byte("k1"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(val) != "v1" {
+		t.Fatalf("unexpected value: %s", string(val))
+	}
+	if !logger.contains("flags mismatch") {
+		t.Fatalf("expected flags mismatch in logs")
+	}
+}
+
 func TestIterKeysAndIter(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {

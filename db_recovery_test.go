@@ -53,6 +53,38 @@ func TestValidateDetectsCorruptRecord(t *testing.T) {
 	}
 }
 
+func TestValidateDetectsUnexpectedEOFWithoutHints(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithHintFiles(false))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Put([]byte("k"), []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	_ = db.Close()
+
+	dataPath := filepath.Join(dir, "data", "000000001.data")
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		t.Fatalf("stat data: %v", err)
+	}
+	if err := os.Truncate(dataPath, info.Size()-1); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	report, err := Validate(dir, WithHintFiles(false))
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if report.CorruptRecords == 0 {
+		t.Fatalf("expected corrupt records > 0")
+	}
+	if !report.HasErrors() {
+		t.Fatalf("expected report to have errors")
+	}
+}
+
 func TestValidateOnOpenSkipsHints(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir)

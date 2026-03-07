@@ -486,6 +486,176 @@ func (db *DB) Delete(key []byte) error {
 	return nil
 }
 
+func (db *DB) Expire(key []byte, ttl time.Duration) (bool, error) {
+	if db == nil {
+		return false, ErrClosed
+	}
+	db.opMu.RLock()
+	defer db.opMu.RUnlock()
+	if len(key) == 0 {
+		return false, ErrInvalidKey
+	}
+	if len(key) > db.opts.MaxKeySize {
+		return false, ErrOversized
+	}
+
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if err := db.ensureOpen(); err != nil {
+		return false, err
+	}
+
+	now := time.Now()
+	db.mu.RLock()
+	meta, ok := db.indexGet(key)
+	db.mu.RUnlock()
+	if !ok || meta.Deleted {
+		return false, nil
+	}
+	if isExpired(meta, now) {
+		db.expireKeys([][]byte{append([]byte(nil), key...)})
+		return false, nil
+	}
+
+	if ttl <= 0 {
+		rec := record.Record{
+			Timestamp: now.UnixNano(),
+			ExpiresAt: 0,
+			Key:       key,
+			Value:     nil,
+			Flags:     record.FlagDeleted,
+			Codec:     0,
+		}
+		buf, err := record.Encode(rec)
+		if err != nil {
+			return false, err
+		}
+		size := uint32(len(buf))
+		if err := db.rotateIfNeeded(int64(size)); err != nil {
+			return false, err
+		}
+		offset := db.active.size
+		if _, err := db.active.file.Write(buf); err != nil {
+			return false, err
+		}
+		db.active.size += int64(size)
+
+		if db.opts.UseHintFiles && db.active.hint != nil {
+			hintEntry := index.HintEntry{
+				Key:     append([]byte(nil), key...),
+				FileID:  db.active.id,
+				Offset:  offset,
+				Size:    size,
+				TS:      rec.Timestamp,
+				Expires: rec.ExpiresAt,
+				Flags:   rec.Flags,
+			}
+			if err := index.WriteHint(db.active.hint, hintEntry); err != nil {
+				logf(db.opts.Logger, "bitgask: hint write failed: %v", err)
+			} else if db.opts.HintFileSync && db.opts.SyncOnDelete {
+				if err := db.active.hint.Sync(); err != nil {
+					logf(db.opts.Logger, "bitgask: hint sync failed: %v", err)
+				}
+			}
+		}
+		if db.opts.SyncOnDelete {
+			_ = db.active.file.Sync()
+		}
+
+		deletedMeta := RecordMeta{
+			ExpiresAt: time.Time{},
+			Deleted:   true,
+			Timestamp: timeFromUnixNano(rec.Timestamp),
+			FileID:    db.active.id,
+			Offset:    offset,
+			Size:      size,
+		}
+		db.mu.Lock()
+		db.stats.DeadBytes += int64(meta.Size)
+		db.stats.DeadBytes += int64(size)
+		db.stats.TotalBytes += int64(size)
+		db.stats.Keys--
+		db.indexSet(key, deletedMeta)
+		db.mu.Unlock()
+		return true, nil
+	}
+
+	val, err := db.readValue(meta)
+	if err != nil {
+		if errors.Is(err, ErrExpired) {
+			db.expireKeys([][]byte{append([]byte(nil), key...)})
+			return false, nil
+		}
+		if errors.Is(err, ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	rec := record.Record{
+		Timestamp: now.UnixNano(),
+		ExpiresAt: now.Add(ttl).UnixNano(),
+		Key:       key,
+		Value:     val,
+		Flags:     0,
+		Codec:     0,
+	}
+	buf, err := encodeWithOptions(rec, db.opts)
+	if err != nil {
+		return false, err
+	}
+	size := uint32(len(buf))
+	if err := db.rotateIfNeeded(int64(size)); err != nil {
+		return false, err
+	}
+	offset := db.active.size
+	if _, err := db.active.file.Write(buf); err != nil {
+		return false, err
+	}
+	db.active.size += int64(size)
+
+	flags := uint8(0)
+	if len(buf) > 28 {
+		flags = buf[28]
+	}
+	if db.opts.UseHintFiles && db.active.hint != nil {
+		hintEntry := index.HintEntry{
+			Key:     append([]byte(nil), key...),
+			FileID:  db.active.id,
+			Offset:  offset,
+			Size:    size,
+			TS:      rec.Timestamp,
+			Expires: rec.ExpiresAt,
+			Flags:   flags,
+		}
+		if err := index.WriteHint(db.active.hint, hintEntry); err != nil {
+			logf(db.opts.Logger, "bitgask: hint write failed: %v", err)
+		} else if db.opts.HintFileSync && db.opts.SyncOnPut {
+			if err := db.active.hint.Sync(); err != nil {
+				logf(db.opts.Logger, "bitgask: hint sync failed: %v", err)
+			}
+		}
+	}
+	if db.opts.SyncOnPut {
+		_ = db.active.file.Sync()
+	}
+
+	newMeta := RecordMeta{
+		ExpiresAt: timeFromUnixNano(rec.ExpiresAt),
+		Deleted:   false,
+		Timestamp: timeFromUnixNano(rec.Timestamp),
+		FileID:    db.active.id,
+		Offset:    offset,
+		Size:      size,
+	}
+	db.mu.Lock()
+	db.stats.DeadBytes += int64(meta.Size)
+	db.stats.TotalBytes += int64(size)
+	db.indexSet(key, newMeta)
+	db.mu.Unlock()
+	return true, nil
+}
+
 func (db *DB) Has(key []byte) (bool, error) {
 	if db == nil {
 		return false, ErrClosed
@@ -1214,6 +1384,12 @@ type keydirEntry struct {
 	Meta RecordMeta
 }
 
+type mergePreparedRecord struct {
+	key  []byte
+	meta RecordMeta
+	buf  []byte
+}
+
 func (db *DB) snapshotEntries(prefix, start, end []byte, pred func(key []byte, meta RecordMeta) bool) ([]keydirEntry, [][]byte, error) {
 	if db == nil {
 		return nil, nil, ErrClosed
@@ -1389,47 +1565,38 @@ func (db *DB) runMerge() error {
 
 	newIndex := keydir.NewRadix()
 	var newStats Stats
-	for _, entry := range entries {
-		meta := entry.Meta
-		if meta.Deleted {
-			continue
-		}
-		if isExpired(meta, now) {
-			continue
-		}
-		val, err := db.readValue(meta)
-		if err != nil {
-			if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrExpired) {
+	if db.opts.MergeConcurrency <= 1 {
+		for _, entry := range entries {
+			meta := entry.Meta
+			if meta.Deleted || isExpired(meta, now) {
 				continue
 			}
+			prepared, ok, err := db.prepareMergeRecord(entry)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			offset, size, err := writer.write(prepared.buf)
+			if err != nil {
+				return err
+			}
+			newMeta := RecordMeta{
+				ExpiresAt: prepared.meta.ExpiresAt,
+				Deleted:   false,
+				Timestamp: prepared.meta.Timestamp,
+				FileID:    writer.fileID,
+				Offset:    offset,
+				Size:      size,
+			}
+			newIndex.Set(prepared.key, newMeta)
+			newStats.TotalBytes += int64(size)
+		}
+	} else {
+		if err := db.mergeConcurrently(entries, now, writer, newIndex, &newStats); err != nil {
 			return err
 		}
-		rec := record.Record{
-			Timestamp: meta.Timestamp.UnixNano(),
-			ExpiresAt: unixNano(meta.ExpiresAt),
-			Key:       entry.Key,
-			Value:     val,
-			Flags:     0,
-			Codec:     0,
-		}
-		buf, err := encodeWithOptions(rec, db.opts)
-		if err != nil {
-			return err
-		}
-		offset, size, err := writer.write(buf)
-		if err != nil {
-			return err
-		}
-		newMeta := RecordMeta{
-			ExpiresAt: meta.ExpiresAt,
-			Deleted:   false,
-			Timestamp: meta.Timestamp,
-			FileID:    writer.fileID,
-			Offset:    offset,
-			Size:      size,
-		}
-		newIndex.Set(entry.Key, newMeta)
-		newStats.TotalBytes += int64(size)
 	}
 	newStats.Keys = newIndex.Len()
 	newStats.DeadBytes = 0
@@ -1508,6 +1675,139 @@ func (db *DB) runMerge() error {
 	db.stats = newStats
 	db.mu.Unlock()
 	return nil
+}
+
+func (db *DB) prepareMergeRecord(entry keydirEntry) (mergePreparedRecord, bool, error) {
+	meta := entry.Meta
+	val, err := db.readValue(meta)
+	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrExpired) {
+			return mergePreparedRecord{}, false, nil
+		}
+		return mergePreparedRecord{}, false, err
+	}
+	rec := record.Record{
+		Timestamp: meta.Timestamp.UnixNano(),
+		ExpiresAt: unixNano(meta.ExpiresAt),
+		Key:       entry.Key,
+		Value:     val,
+		Flags:     0,
+		Codec:     0,
+	}
+	buf, err := encodeWithOptions(rec, db.opts)
+	if err != nil {
+		return mergePreparedRecord{}, false, err
+	}
+	return mergePreparedRecord{
+		key:  entry.Key,
+		meta: meta,
+		buf:  buf,
+	}, true, nil
+}
+
+func (db *DB) mergeConcurrently(entries []keydirEntry, now time.Time, writer *mergeWriter, newIndex keydir.Keydir, newStats *Stats) error {
+	jobs := make(chan keydirEntry)
+	results := make(chan mergePreparedRecord, db.opts.MergeConcurrency)
+	done := make(chan struct{})
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr != nil {
+			return
+		}
+		firstErr = err
+		close(done)
+	}
+
+	worker := func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			case entry, ok := <-jobs:
+				if !ok {
+					return
+				}
+				prepared, ok, err := db.prepareMergeRecord(entry)
+				if err != nil {
+					setErr(err)
+					return
+				}
+				if !ok {
+					continue
+				}
+				select {
+				case <-done:
+					return
+				case results <- prepared:
+				}
+			}
+		}
+	}
+
+	wg.Add(db.opts.MergeConcurrency)
+	for i := 0; i < db.opts.MergeConcurrency; i++ {
+		go worker()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, entry := range entries {
+			meta := entry.Meta
+			if meta.Deleted || isExpired(meta, now) {
+				continue
+			}
+			select {
+			case <-done:
+				return
+			case jobs <- entry:
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for prepared := range results {
+		errMu.Lock()
+		err := firstErr
+		errMu.Unlock()
+		if err != nil {
+			continue
+		}
+
+		offset, size, err := writer.write(prepared.buf)
+		if err != nil {
+			setErr(err)
+			continue
+		}
+		newMeta := RecordMeta{
+			ExpiresAt: prepared.meta.ExpiresAt,
+			Deleted:   false,
+			Timestamp: prepared.meta.Timestamp,
+			FileID:    writer.fileID,
+			Offset:    offset,
+			Size:      size,
+		}
+		newIndex.Set(prepared.key, newMeta)
+		newStats.TotalBytes += int64(size)
+	}
+
+	errMu.Lock()
+	defer errMu.Unlock()
+	return firstErr
 }
 
 func encodeWithOptions(rec record.Record, opts config) ([]byte, error) {
@@ -1748,13 +2048,33 @@ func loadHintFile(dataDir string, id uint32, opts config) fileLoadResult {
 			logf(opts.Logger, "bitgask: hint read failed for file %d: %v", id, err)
 			return fileLoadResult{id: id, err: err}
 		}
-		rec, _, err := record.ReadAt(dataFile, entry.Offset)
+		rec, recSize, err := record.ReadAt(dataFile, entry.Offset)
 		if err != nil {
 			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: %v", id, entry.Offset, err)
 			return fileLoadResult{id: id, err: ErrCorrupt}
 		}
 		if !bytes.Equal(rec.Key, entry.Key) {
 			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: key mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if entry.FileID != id {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: file id mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if entry.Size != uint32(recSize) {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: size mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if entry.TS != rec.Timestamp {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: timestamp mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if entry.Expires != rec.ExpiresAt {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: expires mismatch", id, entry.Offset)
+			return fileLoadResult{id: id, err: ErrCorrupt}
+		}
+		if entry.Flags != rec.Flags {
+			logf(opts.Logger, "bitgask: hint validation failed for file %d offset %d: flags mismatch", id, entry.Offset)
 			return fileLoadResult{id: id, err: ErrCorrupt}
 		}
 		meta := RecordMeta{

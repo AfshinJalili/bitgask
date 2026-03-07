@@ -36,3 +36,46 @@ jobs:
           cache: true
       - name: Race
         run: go test -race ./...
+
+  quality:
+    name: quality (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: true
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: Command coverage gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(go test ./cmd/bitgask ./cmd/bitgaskd -cover)"
+          printf '%s\n' "$output"
+
+          coverage_for() {
+            local pkg="$1"
+            awk -v pkg="$pkg" '$2 == pkg { gsub(/%/, "", $5); print $5 }' <<<"$output"
+          }
+
+          bitgask_cov="$(coverage_for github.com/AfshinJalili/bitgask/cmd/bitgask)"
+          bitgaskd_cov="$(coverage_for github.com/AfshinJalili/bitgask/cmd/bitgaskd)"
+
+          test -n "$bitgask_cov"
+          test -n "$bitgaskd_cov"
+
+          awk -v actual="$bitgask_cov" 'BEGIN { if (actual + 0 < 70.0) exit 1 }' || {
+            echo "cmd/bitgask coverage gate failed: expected >= 70.0%, got ${bitgask_cov}%"
+            exit 1
+          }
+          awk -v actual="$bitgaskd_cov" 'BEGIN { if (actual + 0 < 25.0) exit 1 }' || {
+            echo "cmd/bitgaskd coverage gate failed: expected >= 25.0%, got ${bitgaskd_cov}%"
+            exit 1
+          }
+      - name: Server integration tests
+        run: go test -tags integration ./cmd/bitgaskd
+      - name: Bench compare tests
+        working-directory: bench/compare
+        run: go test ./...
