@@ -32,10 +32,11 @@ type txnEntry struct {
 
 type emptySnapshot struct{}
 
-func (emptySnapshot) Get(_ []byte) (interface{}, bool)   { return nil, false }
-func (emptySnapshot) Len() int                           { return 0 }
-func (emptySnapshot) Range(_ keydir.Iterator)            {}
-func (emptySnapshot) Prefix(_ []byte, _ keydir.Iterator) {}
+func (emptySnapshot) Get(_ []byte) (interface{}, bool)       { return nil, false }
+func (emptySnapshot) Len() int                               { return 0 }
+func (emptySnapshot) Range(_ keydir.Iterator)                {}
+func (emptySnapshot) LowerBound(_ []byte, _ keydir.Iterator) {}
+func (emptySnapshot) Prefix(_ []byte, _ keydir.Iterator)     {}
 
 func (db *DB) Transaction() *Txn {
 	if db == nil {

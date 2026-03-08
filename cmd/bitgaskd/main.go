@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -108,35 +109,10 @@ func main() {
 			}
 			key := cmd.Args[1]
 			val := cmd.Args[2]
-			var ttl time.Duration
-			if len(cmd.Args) > 3 {
-				if (len(cmd.Args)-3)%2 != 0 {
-					conn.WriteError("ERR syntax error")
-					return
-				}
-				for i := 3; i < len(cmd.Args); i += 2 {
-					opt := strings.ToUpper(string(cmd.Args[i]))
-					arg := string(cmd.Args[i+1])
-					switch opt {
-					case "EX":
-						sec, err := strconv.ParseInt(arg, 10, 64)
-						if err != nil {
-							conn.WriteError("ERR invalid EX")
-							return
-						}
-						ttl = time.Duration(sec) * time.Second
-					case "PX":
-						ms, err := strconv.ParseInt(arg, 10, 64)
-						if err != nil {
-							conn.WriteError("ERR invalid PX")
-							return
-						}
-						ttl = time.Duration(ms) * time.Millisecond
-					default:
-						conn.WriteError("ERR unsupported option")
-						return
-					}
-				}
+			ttl, err := parseSetTTLOptions(cmd.Args[3:])
+			if err != nil {
+				conn.WriteError(err.Error())
+				return
 			}
 			if ttl > 0 {
 				err = db.PutWithTTL(key, val, ttl)
@@ -188,7 +164,7 @@ func main() {
 			if len(cmd.Args) > 1 {
 				pattern = string(cmd.Args[1])
 			}
-			keys := collectKeys(db, pattern)
+			keys := collectAllKeys(db, pattern)
 			conn.WriteArray(len(keys))
 			for _, k := range keys {
 				conn.WriteBulk(k)
@@ -199,10 +175,13 @@ func main() {
 				conn.WriteError(err.Error())
 				return
 			}
-			keys := collectKeys(db, pattern)
-			batch, next := scanBatch(keys, cursor, count)
+			batch, next, err := scanKeys(db, cursor, pattern, count)
+			if err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
 			conn.WriteArray(2)
-			conn.WriteBulkString(strconv.Itoa(next))
+			conn.WriteBulkString(next)
 			conn.WriteArray(len(batch))
 			for _, k := range batch {
 				conn.WriteBulk(k)
@@ -231,7 +210,12 @@ func main() {
 				conn.WriteError("ERR invalid EXPIRE")
 				return
 			}
-			conn.WriteInt(setExpire(db, cmd.Args[1], time.Duration(sec)*time.Second))
+			result, err := setExpire(db, cmd.Args[1], time.Duration(sec)*time.Second)
+			if err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
+			conn.WriteInt(result)
 		case "PEXPIRE":
 			if len(cmd.Args) < 3 {
 				conn.WriteError("ERR wrong number of arguments for PEXPIRE")
@@ -242,7 +226,12 @@ func main() {
 				conn.WriteError("ERR invalid PEXPIRE")
 				return
 			}
-			conn.WriteInt(setExpire(db, cmd.Args[1], time.Duration(ms)*time.Millisecond))
+			result, err := setExpire(db, cmd.Args[1], time.Duration(ms)*time.Millisecond)
+			if err != nil {
+				conn.WriteError(err.Error())
+				return
+			}
+			conn.WriteInt(result)
 		case "DBSIZE":
 			conn.WriteInt(db.Stats().Keys)
 		case "INFO":
@@ -278,7 +267,7 @@ func addFlags(fs *flag.FlagSet, cfg *serverConfig) {
 	fs.BoolVar(&cfg.hintSync, "hint-sync", true, "fsync hint files")
 }
 
-func collectKeys(db *bitgask.DB, pattern string) [][]byte {
+func collectAllKeys(db *bitgask.DB, pattern string) [][]byte {
 	keys := make([][]byte, 0)
 	for key := range db.Keys() {
 		if pattern == "*" {
@@ -294,6 +283,20 @@ func collectKeys(db *bitgask.DB, pattern string) [][]byte {
 		}
 	}
 	return keys
+}
+
+func scanKeys(db *bitgask.DB, cursor, pattern string, count int) ([][]byte, string, error) {
+	start, err := decodeScanCursor(cursor)
+	if err != nil {
+		return nil, "", err
+	}
+	keys, next, err := db.ScanKeys(start, count, func(key []byte) bool {
+		return matchPattern(pattern, key)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return keys, encodeScanCursor(next), nil
 }
 
 func ttlForKey(db *bitgask.DB, key []byte, unit time.Duration) int {
@@ -314,24 +317,55 @@ func ttlForKey(db *bitgask.DB, key []byte, unit time.Duration) int {
 	return int(remaining / unit)
 }
 
-func setExpire(db *bitgask.DB, key []byte, ttl time.Duration) int {
+func setExpire(db *bitgask.DB, key []byte, ttl time.Duration) (int, error) {
 	ok, err := db.Expire(key, ttl)
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	if ok {
-		return 1
+		return 1, nil
 	}
-	return 0
+	return 0, nil
 }
 
-func parseScanArgs(args [][]byte) (int, string, int, error) {
-	if len(args) < 2 {
-		return 0, "", 0, fmt.Errorf("ERR wrong number of arguments for SCAN")
+func parseSetTTLOptions(args [][]byte) (time.Duration, error) {
+	if len(args) == 0 {
+		return 0, nil
 	}
-	cursor, err := strconv.Atoi(string(args[1]))
-	if err != nil {
-		return 0, "", 0, fmt.Errorf("ERR invalid cursor")
+	if len(args)%2 != 0 {
+		return 0, fmt.Errorf("ERR syntax error")
+	}
+	var ttl time.Duration
+	for i := 0; i < len(args); i += 2 {
+		opt := strings.ToUpper(string(args[i]))
+		arg := string(args[i+1])
+		switch opt {
+		case "EX":
+			sec, err := strconv.ParseInt(arg, 10, 64)
+			if err != nil || sec <= 0 {
+				return 0, fmt.Errorf("ERR invalid EX")
+			}
+			ttl = time.Duration(sec) * time.Second
+		case "PX":
+			ms, err := strconv.ParseInt(arg, 10, 64)
+			if err != nil || ms <= 0 {
+				return 0, fmt.Errorf("ERR invalid PX")
+			}
+			ttl = time.Duration(ms) * time.Millisecond
+		default:
+			return 0, fmt.Errorf("ERR unsupported option")
+		}
+	}
+	return ttl, nil
+}
+
+func parseScanArgs(args [][]byte) (string, string, int, error) {
+	if len(args) < 2 {
+		return "", "", 0, fmt.Errorf("ERR wrong number of arguments for SCAN")
+	}
+	cursor := string(args[1])
+	if _, err := decodeScanCursor(cursor); err != nil {
+		return "", "", 0, err
 	}
 	pattern := "*"
 	count := 10
@@ -339,7 +373,7 @@ func parseScanArgs(args [][]byte) (int, string, int, error) {
 		return cursor, pattern, count, nil
 	}
 	if (len(args)-2)%2 != 0 {
-		return 0, "", 0, fmt.Errorf("ERR syntax error")
+		return "", "", 0, fmt.Errorf("ERR syntax error")
 	}
 	for i := 2; i < len(args); i += 2 {
 		switch strings.ToUpper(string(args[i])) {
@@ -348,31 +382,41 @@ func parseScanArgs(args [][]byte) (int, string, int, error) {
 		case "COUNT":
 			parsed, err := strconv.Atoi(string(args[i+1]))
 			if err != nil || parsed <= 0 {
-				return 0, "", 0, fmt.Errorf("ERR invalid COUNT")
+				return "", "", 0, fmt.Errorf("ERR invalid COUNT")
 			}
 			count = parsed
 		default:
-			return 0, "", 0, fmt.Errorf("ERR unsupported option")
+			return "", "", 0, fmt.Errorf("ERR unsupported option")
 		}
 	}
 	return cursor, pattern, count, nil
 }
 
-func scanBatch(keys [][]byte, cursor, count int) ([][]byte, int) {
-	if cursor < 0 || cursor >= len(keys) {
-		cursor = 0
+func matchPattern(pattern string, key []byte) bool {
+	if pattern == "*" {
+		return true
 	}
-	if count <= 0 {
-		return keys[:0], 0
+	match, err := path.Match(pattern, string(key))
+	if err != nil {
+		return false
 	}
-	remaining := len(keys) - cursor
-	if count > remaining {
-		count = remaining
+	return match
+}
+
+func decodeScanCursor(cursor string) ([]byte, error) {
+	if cursor == "" || cursor == "0" {
+		return nil, nil
 	}
-	end := cursor + count
-	next := 0
-	if end < len(keys) {
-		next = end
+	decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("ERR invalid cursor")
 	}
-	return keys[cursor:end], next
+	return decoded, nil
+}
+
+func encodeScanCursor(cursor []byte) string {
+	if len(cursor) == 0 {
+		return "0"
+	}
+	return base64.RawURLEncoding.EncodeToString(cursor)
 }

@@ -37,6 +37,24 @@ func (r *Radix) Range(fn Iterator) {
 	})
 }
 
+func (r *Radix) LowerBound(start []byte, fn Iterator) {
+	if len(start) == 0 {
+		r.Range(fn)
+		return
+	}
+	it := r.tree.Root().Iterator()
+	it.SeekLowerBound(start)
+	for {
+		key, value, ok := it.Next()
+		if !ok {
+			return
+		}
+		if !fn(key, value) {
+			return
+		}
+	}
+}
+
 func (r *Radix) Prefix(prefix []byte, fn Iterator) {
 	r.tree.Root().WalkPrefix(prefix, func(key []byte, value interface{}) bool {
 		return !fn(key, value)
@@ -63,6 +81,24 @@ func (s *radixSnapshot) Range(fn Iterator) {
 	s.tree.Root().Walk(func(key []byte, value interface{}) bool {
 		return !fn(key, value)
 	})
+}
+
+func (s *radixSnapshot) LowerBound(start []byte, fn Iterator) {
+	if len(start) == 0 {
+		s.Range(fn)
+		return
+	}
+	it := s.tree.Root().Iterator()
+	it.SeekLowerBound(start)
+	for {
+		key, value, ok := it.Next()
+		if !ok {
+			return
+		}
+		if !fn(key, value) {
+			return
+		}
+	}
 }
 
 func (s *radixSnapshot) Prefix(prefix []byte, fn Iterator) {

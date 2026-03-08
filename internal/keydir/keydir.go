@@ -8,6 +8,7 @@ type Keydir interface {
 	Delete(key []byte)
 	Len() int
 	Range(fn Iterator)
+	LowerBound(start []byte, fn Iterator)
 	Prefix(prefix []byte, fn Iterator)
 	Snapshot() Snapshot
 }
@@ -16,5 +17,6 @@ type Snapshot interface {
 	Get(key []byte) (interface{}, bool)
 	Len() int
 	Range(fn Iterator)
+	LowerBound(start []byte, fn Iterator)
 	Prefix(prefix []byte, fn Iterator)
 }

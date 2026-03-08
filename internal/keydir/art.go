@@ -1,5 +1,7 @@
 package keydir
 
+import "bytes"
+
 import art "github.com/plar/go-adaptive-radix-tree"
 
 type ART struct {
@@ -31,6 +33,26 @@ func (a *ART) Range(fn Iterator) {
 	a.tree.ForEach(func(node art.Node) bool {
 		return fn(node.Key(), node.Value())
 	})
+}
+
+func (a *ART) LowerBound(start []byte, fn Iterator) {
+	if len(start) == 0 {
+		a.Range(fn)
+		return
+	}
+	it := a.tree.Iterator()
+	for it.HasNext() {
+		node, err := it.Next()
+		if err != nil {
+			return
+		}
+		if bytes.Compare(node.Key(), start) < 0 {
+			continue
+		}
+		if !fn(node.Key(), node.Value()) {
+			return
+		}
+	}
 }
 
 func (a *ART) Prefix(prefix []byte, fn Iterator) {
@@ -65,6 +87,26 @@ func (s *artSnapshot) Range(fn Iterator) {
 	s.tree.ForEach(func(node art.Node) bool {
 		return fn(node.Key(), node.Value())
 	})
+}
+
+func (s *artSnapshot) LowerBound(start []byte, fn Iterator) {
+	if len(start) == 0 {
+		s.Range(fn)
+		return
+	}
+	it := s.tree.Iterator()
+	for it.HasNext() {
+		node, err := it.Next()
+		if err != nil {
+			return
+		}
+		if bytes.Compare(node.Key(), start) < 0 {
+			continue
+		}
+		if !fn(node.Key(), node.Value()) {
+			return
+		}
+	}
 }
 
 func (s *artSnapshot) Prefix(prefix []byte, fn Iterator) {

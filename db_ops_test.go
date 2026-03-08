@@ -1,7 +1,11 @@
 package bitgask
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +37,32 @@ func TestBackupProducesCopy(t *testing.T) {
 	}
 }
 
+func TestBackupRejectsNonEmptyDestination(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	backupDir := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(filepath.Join(backupDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir backup data: %v", err)
+	}
+	stalePath := filepath.Join(backupDir, "data", "000000999.data")
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	err = db.Backup(backupDir)
+	if err == nil || !strings.Contains(err.Error(), "backup destination must be empty") {
+		t.Fatalf("expected non-empty destination error, got %v", err)
+	}
+}
+
 func TestDeleteAllResets(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
@@ -54,6 +84,40 @@ func TestDeleteAllResets(t *testing.T) {
 	}
 	if err := db.Put([]byte("k2"), []byte("v2")); err != nil {
 		t.Fatalf("put after delete-all: %v", err)
+	}
+}
+
+func TestDeleteAllRestoresStateAfterRemoveFailure(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	errBoom := errors.New("remove failed")
+	var calls int
+	removeFileHook = func(path string) error {
+		if calls == 0 && (strings.HasSuffix(path, ".data") || strings.HasSuffix(path, ".hint")) {
+			calls++
+			return errBoom
+		}
+		return os.Remove(path)
+	}
+	t.Cleanup(func() { removeFileHook = nil })
+
+	if err := db.DeleteAll(); !errors.Is(err, errBoom) {
+		t.Fatalf("expected delete-all to return remove error, got %v", err)
+	}
+	val, err := db.Get([]byte("k1"))
+	if err != nil {
+		t.Fatalf("expected state restored after delete-all failure, got %v", err)
+	}
+	if string(val) != "v1" {
+		t.Fatalf("expected restored value v1, got %q", val)
 	}
 }
 
@@ -168,5 +232,86 @@ func TestExpireDoesNotResurrectStaleValue(t *testing.T) {
 		if string(val) != "v2" {
 			t.Fatalf("iteration %d: expected latest value v2, got %q", i, val)
 		}
+	}
+}
+
+func TestExpireDeletePropagatesSyncFailure(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncOnDelete(true))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	errSync := fmt.Errorf("sync failed")
+	syncDataFileHook = func(_ *os.File) error { return errSync }
+	t.Cleanup(func() { syncDataFileHook = nil })
+
+	ok, err := db.Expire([]byte("k"), 0)
+	if !errors.Is(err, errSync) {
+		t.Fatalf("expected sync error, got %v", err)
+	}
+	if ok {
+		t.Fatalf("expected expire delete to report failure")
+	}
+	val, err := db.Get([]byte("k"))
+	if err != nil || string(val) != "v" {
+		t.Fatalf("expected original value to remain visible, got %v %q", err, val)
+	}
+}
+
+func TestExpireUpdatePropagatesSyncFailure(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncOnPut(true))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	errSync := fmt.Errorf("sync failed")
+	syncDataFileHook = func(_ *os.File) error { return errSync }
+	t.Cleanup(func() { syncDataFileHook = nil })
+
+	ok, err := db.Expire([]byte("k"), time.Minute)
+	if !errors.Is(err, errSync) {
+		t.Fatalf("expected sync error, got %v", err)
+	}
+	if ok {
+		t.Fatalf("expected expire update to report failure")
+	}
+	val, err := db.Get([]byte("k"))
+	if err != nil || string(val) != "v" {
+		t.Fatalf("expected original value to remain visible, got %v %q", err, val)
+	}
+}
+
+func TestScanKeysUsesCursorBudget(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	for _, key := range []string{"a", "b", "c"} {
+		if err := db.Put([]byte(key), []byte("v")); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	keys, cursor, err := db.ScanKeys(nil, 1, func(key []byte) bool {
+		return string(key) == "c"
+	})
+	if err != nil {
+		t.Fatalf("scan keys: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("expected no match on first bounded page, got %d", len(keys))
+	}
+	if string(cursor) != "a" {
+		t.Fatalf("expected cursor to advance to first visited key, got %q", cursor)
 	}
 }

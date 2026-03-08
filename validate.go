@@ -110,8 +110,8 @@ func Validate(path string, opts ...Option) (Report, error) {
 					report.Errors = append(report.Errors, err)
 					continue
 				}
-				if string(rec.Key) != string(entry.Key) {
-					report.Errors = append(report.Errors, fmt.Errorf("hint key mismatch at file %d offset %d", entry.FileID, entry.Offset))
+				if err := validateHintEntryRecord(id, entry, rec, record.Size(len(rec.Key), len(rec.Value))); err != nil {
+					report.Errors = append(report.Errors, err)
 				}
 			}
 			_ = hintFile.Close()

@@ -3,7 +3,9 @@ package bitgask
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,5 +117,80 @@ func TestConcurrentMergeWithReads(t *testing.T) {
 	case err := <-errCh:
 		t.Fatalf("unexpected error: %v", err)
 	default:
+	}
+}
+
+func TestOpenDataFileConcurrentMissSingleFlight(t *testing.T) {
+	opts := []Option{
+		WithMaxDataFileSize(96),
+		WithSyncOnPut(false),
+		WithSyncOnDelete(false),
+	}
+	db, err := Open(t.TempDir(), opts...)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	payload := make([]byte, 40)
+	for i := range payload {
+		payload[i] = 'x'
+	}
+	if err := db.Put([]byte("a"), payload); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	if err := db.Put([]byte("b"), payload); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+
+	db.mu.RLock()
+	if _, ok := db.dataFiles[1]; ok {
+		db.mu.RUnlock()
+		t.Fatalf("expected historical file 1 to require lazy open")
+	}
+	db.mu.RUnlock()
+
+	var opens int32
+	openReadonlyDataFileHook = func(path string) (*os.File, error) {
+		atomic.AddInt32(&opens, 1)
+		time.Sleep(20 * time.Millisecond)
+		return os.Open(path)
+	}
+	t.Cleanup(func() { openReadonlyDataFileHook = nil })
+
+	start := make(chan struct{})
+	errCh := make(chan error, 16)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			f, err := db.openDataFile(1)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if f == nil {
+				errCh <- fmt.Errorf("nil file handle")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("openDataFile: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&opens); got != 1 {
+		t.Fatalf("expected exactly one open call, got %d", got)
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.dataFiles[1] == nil {
+		t.Fatalf("expected historical file 1 to be cached after open")
 	}
 }
