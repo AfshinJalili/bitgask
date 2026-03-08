@@ -1,28 +1,49 @@
 # bitgask
 
-Production-grade Bitcask-style log-structured key-value store in Go.
+`bitgask` is a production-oriented Bitcask-style log-structured key-value store for Go.
 
-## Features
-- Append-only data files
-- In-memory keydir using a radix tree
-- CRC integrity checks
+It provides an append-only storage engine, an in-memory keydir, TTL support, background compaction, strong durability by default, a CLI, and a minimal RESP-compatible server.
+
+## Highlights
+- Append-only data files with CRC validation
+- In-memory keydir backed by radix/ART-style structures
 - Optional Snappy compression
-- Per-entry TTL
-- Background compaction plus manual merge
-- Single-process lock
-- Strong durability by default (fsync per write)
-- CLI and a minimal RESP-compatible server
+- Per-entry TTL and explicit expiry updates
+- Background merge plus manual compaction
+- Single-process lock enforcement
+- Strong durability by default with configurable sync policy
+- Go API, `bitgask` CLI, and `bitgaskd` server
+
+## Requirements
+- Go `1.22+`
 
 ## Install
+
+### Library
+Add the module to your project:
+
 ```bash
-go get github.com/AfshinJalili/bitgask
+go get github.com/AfshinJalili/bitgask@latest
 ```
 
-## Quickstart (Go API)
+### CLI
+```bash
+go install github.com/AfshinJalili/bitgask/cmd/bitgask@latest
+```
+
+### Server
+```bash
+go install github.com/AfshinJalili/bitgask/cmd/bitgaskd@latest
+```
+
+## Quick Start
+
+### Go API
 ```go
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -41,68 +62,78 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if err := db.PutWithTTL([]byte("session"), []byte("abc123"), 30*time.Second); err != nil {
+		log.Fatal(err)
+	}
+
 	val, err := db.Get([]byte("hello"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println(string(val))
 
-	_ = db.PutWithTTL([]byte("temp"), []byte("value"), 10*time.Second)
+	err = db.IterKeys(context.Background(), func(key []byte) bool {
+		fmt.Println(string(key))
+		return true
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-## Examples
+### CLI
+```bash
+bitgask put -dir ./data hello world
+bitgask get -dir ./data hello
+bitgask stats -dir ./data
+```
+
+### Server
+```bash
+bitgaskd -dir ./data -addr 127.0.0.1:6380
+
+redis-cli -p 6380 SET hello world
+redis-cli -p 6380 GET hello
+redis-cli -p 6380 SET session token EX 30
+```
+
+## Core Usage
 
 ### Basic CRUD
 ```go
-db, _ := bitgask.Open("./data")
+db, err := bitgask.Open("./data")
+if err != nil {
+	log.Fatal(err)
+}
 defer db.Close()
 
-_ = db.Put([]byte("k"), []byte("v"))
-val, _ := db.Get([]byte("k"))
-_ = db.Delete([]byte("k"))
+if err := db.Put([]byte("k"), []byte("v")); err != nil {
+	log.Fatal(err)
+}
+
+val, err := db.Get([]byte("k"))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(string(val))
+
+if err := db.Delete([]byte("k")); err != nil {
+	log.Fatal(err)
+}
 ```
 
 ### TTL
 ```go
-_ = db.PutWithTTL([]byte("session"), []byte("abc"), 30*time.Second)
-
-val, err := db.Get([]byte("session"))
-_ = val
-_ = err // ErrExpired when TTL elapses
-```
-
-### Safe vs High Throughput
-```go
-// Safe defaults: fsync on each write (default behavior).
-db, _ := bitgask.Open("./data")
-
-// Higher throughput: fsync in the background.
-db, _ = bitgask.Open("./data",
-	bitgask.WithSyncOnPut(false),
-	bitgask.WithSyncOnDelete(false),
-	bitgask.WithSyncInterval(1*time.Second),
-)
-```
-
-### Merge and Reclaimable Space
-```go
-if _, _, ratio := db.Reclaimable(); ratio > 0.6 {
-	_ = db.Merge()
+if err := db.PutWithTTL([]byte("session"), []byte("abc"), 30*time.Second); err != nil {
+	log.Fatal(err)
 }
-```
 
-### Streaming Iteration
-```go
-_ = db.IterKeys(context.Background(), func(key []byte) bool {
-	fmt.Println(string(key))
-	return true
-})
-
-_ = db.Iter(context.Background(), []byte("user:"), func(key, value []byte, meta bitgask.RecordMeta) bool {
-	fmt.Println(string(key), string(value))
-	return true
-})
+ok, err := db.Expire([]byte("session"), 5*time.Minute)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(ok)
 ```
 
 ### Transactions
@@ -110,66 +141,127 @@ _ = db.Iter(context.Background(), []byte("user:"), func(key, value []byte, meta 
 txn := db.Transaction()
 defer txn.Discard()
 
-_ = txn.Put([]byte("k"), []byte("v1"))
-val, _ := txn.Get([]byte("k")) // read-your-writes
-_ = val
+if err := txn.Put([]byte("user:1"), []byte("alice")); err != nil {
+	log.Fatal(err)
+}
+
+val, err := txn.Get([]byte("user:1"))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(string(val))
 
 if err := txn.Commit(); err != nil {
 	log.Fatal(err)
 }
 ```
-Transactions are single-goroutine and use last-commit-wins for conflicts. Commit durability follows the same sync options as `Put`/`Delete`.
 
-## Durability
-By default each `Put` and `Delete` is fsynced for strong durability. To trade durability for throughput, disable per-write sync and enable periodic syncing with `WithSyncInterval`.
+Transactions are snapshot-based, single-goroutine, and use last-commit-wins conflict behavior. They are batched for commit, but they are not a distributed or cross-process transaction system.
+
+### Iteration
+```go
+err := db.Iter(context.Background(), []byte("user:"), func(key, value []byte, meta bitgask.RecordMeta) bool {
+	fmt.Printf("%s=%s expires=%v\n", key, value, meta.ExpiresAt)
+	return true
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+Use `IterKeys` and `Iter` for lower-overhead streaming callbacks. Use `Keys`, `Scan`, `Range`, `Sift`, `Fold`, and `NewIterator` when snapshot-style traversal is a better fit.
+
+## Durability and Performance
+
+By default, each `Put`, `Delete`, and synchronous transaction commit is fsynced for strong durability.
+
+For higher throughput, you can disable per-write fsync and enable periodic sync:
+
+```go
+db, err := bitgask.Open(
+	"./data",
+	bitgask.WithSyncOnPut(false),
+	bitgask.WithSyncOnDelete(false),
+	bitgask.WithSyncInterval(time.Second),
+)
+if err != nil {
+	log.Fatal(err)
+}
+defer db.Close()
+```
+
+This trades crash durability for write throughput. Use it only when that tradeoff is acceptable.
 
 ## Compaction
-Compaction (merge) rewrites live keys into new data files and removes tombstones and expired entries. It runs in the background, can be triggered manually with `db.Merge()`, and can fan out record loading/encoding work with `WithMergeConcurrency`.
 
-## CLI Quickstart
-```bash
-# install
-GO111MODULE=on go install github.com/AfshinJalili/bitgask/cmd/bitgask@latest
+Compaction rewrites live keys into fresh data files and removes overwritten, expired, and tombstoned entries.
 
-# put/get
-bitgask put -dir ./data hello world
-bitgask get -dir ./data hello
-
-# stats
-bitgask stats -dir ./data
+```go
+dead, total, ratio := db.Reclaimable()
+if total > 0 && ratio > 0.60 {
+	if err := db.Merge(); err != nil {
+		log.Fatal(err)
+	}
+}
+fmt.Println(dead, total, ratio)
 ```
 
-## Server Quickstart
+You can also call `db.CompactIfNeeded()` or configure background merge behavior with options such as `WithMergeInterval`, `WithMergeMinTotal`, and `WithMergeTriggerRatio`.
+
+## CLI Overview
+
+The `bitgask` CLI supports:
+- `get`, `put`, `del`, `exists`
+- `keys`, `scan`
+- `stats`, `reclaimable`, `gc`, `merge`
+- `backup`, `delete-all`, `reopen`
+- `validate`, `repair`, `version`
+
+Examples:
+
 ```bash
-# install
-GO111MODULE=on go install github.com/AfshinJalili/bitgask/cmd/bitgaskd@latest
-
-# run RESP-compatible server
-bitgaskd -dir ./data -addr 127.0.0.1:6380
-
-# use redis-cli
-redis-cli -p 6380 SET hello world
-redis-cli -p 6380 GET hello
+bitgask put -dir ./data -entry-ttl 10s session token
+bitgask scan -dir ./data user:
+bitgask backup -dir ./data ./backup
+bitgask validate -dir ./data
 ```
 
-## Iteration Modes
-`Keys`, `Scan`, `Range`, `Sift`, and `NewIterator` snapshot the keydir and can allocate proportionally to key count.
-`IterKeys` and `Iter` stream results with lower memory overhead but hold a read lock while calling the callback.
+## Server Overview
 
-## Limitations and Non-goals
-- Single-process access enforced by a lock file.
-- Entire keydir is in memory, so RAM scales with key count.
-- Transactions are single-process, single-goroutine snapshots with last-commit-wins conflict handling; there is no multi-key atomicity across separate transactions or serializable cross-process coordination.
-- `bitgaskd` is not a full Redis implementation.
-- `bitgaskd` `KEYS` and `SCAN` materialize a key snapshot in memory and are intended for modest keyspaces.
+`bitgaskd` is a minimal RESP-compatible server for testing and simple deployments. It is not a full Redis implementation.
+
+Supported commands:
+- `PING`
+- `GET`, `SET`
+- `DEL`, `EXISTS`
+- `KEYS`, `SCAN`
+- `TTL`, `PTTL`
+- `EXPIRE`, `PEXPIRE`
+- `DBSIZE`, `INFO`
+
+Notes:
+- `SET` supports `EX` and `PX`.
+- `SCAN` uses an opaque cursor and bounded per-request traversal.
+- `KEYS` still returns a full matching snapshot and is the expensive command.
+- There is no authentication, replication, persistence protocol compatibility, or broader Redis feature parity.
+
+## Operational Notes
+
+- Single-process access is enforced with a lock file.
+- The keydir is fully resident in memory, so RAM usage scales with key count.
+- `Validate` performs offline integrity checks without mutating data.
+- `Repair` rebuilds from data files and can recover from certain tail-corruption cases.
+- `Backup` now expects a fresh or empty destination directory.
 
 ## Documentation
-- API reference: docs/API.md
-- Options and defaults: docs/Options.md
-- Operations guide: docs/Operations.md
-- Architecture: docs/Architecture.md
-- CLI: docs/CLI.md
-- Server: docs/Server.md
+
+- [docs/API.md](docs/API.md)
+- [docs/Options.md](docs/Options.md)
+- [docs/Operations.md](docs/Operations.md)
+- [docs/Architecture.md](docs/Architecture.md)
+- [docs/CLI.md](docs/CLI.md)
+- [docs/Server.md](docs/Server.md)
 
 ## License
+
 MIT
